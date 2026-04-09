@@ -1,0 +1,22 @@
+# ── Core scientific stack ─────────────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+h5py>=3.8
+pyhdf>=0.10           # for reading MYD06 HDF4 files
+
+# ── Deep learning ─────────────────────────────────────────────────────────────
+torch>=2.1
+torchvision>=0.16
+
+# ── Geospatial / satellite ────────────────────────────────────────────────────
+cartopy>=0.22          # plotting only (optional for inference)
+pyproj>=3.5
+scikit-learn>=1.3      # confusion matrix in test.py
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.7
+seaborn>=0.12
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+tqdm>=4.65
