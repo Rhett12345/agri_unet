@@ -11,7 +11,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  Root directories
 # ─────────────────────────────────────────────────────────────────────────────
-ROOT = Path("/home/yuq/cloudmask/unet_out/workdir")           # Change to your project root
+ROOT = Path("/home/yuq/cloudmask/unet_workdir")           # Change to your project root
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Raw data – folder-per-day layout
