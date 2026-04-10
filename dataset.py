@@ -324,6 +324,7 @@ class AGRIMyd06Dataset(Dataset):
     Each item is a tuple:
         agri   : FloatTensor  (n_agri_channels, patch_H, patch_W) – z-score normalised
         geo    : FloatTensor  (3, patch_H, patch_W)  [lat, lon, ELE] – raw
+        geo    : FloatTensor  (2, patch_H, patch_W)  [lat, lon] – raw
         labels : FloatTensor  (4, patch_H, patch_W)
                    ch0 = CLP (float, integer class 0-4)
                    ch1 = CER (µm,  z-score normalised, NaN for clear/missing)
@@ -374,7 +375,7 @@ class AGRIMyd06Dataset(Dataset):
 
                 lat = f["AGRI/Geolocation/lat"][i:i + ph, j:j + pw].astype(np.float32)
                 lon = f["AGRI/Geolocation/lon"][i:i + ph, j:j + pw].astype(np.float32)
-                ele = f["AGRI/Aux/ELE"][i:i + ph, j:j + pw].astype(np.float32)
+                # ele = f["AGRI/Aux/ELE"][i:i + ph, j:j + pw].astype(np.float32)
 
                 CLP = f["Labels/CLP"][i:i + ph, j:j + pw].astype(np.float32)
                 CER = f["Labels/CER"][i:i + ph, j:j + pw].astype(np.float32)
@@ -386,7 +387,8 @@ class AGRIMyd06Dataset(Dataset):
             log.warning("Read error at %s [%d,%d]: %s", h5f.name, i, j, exc)
             C = len(cfg.AGRI_BT_CHANNEL_INDICES)
             agri_t = torch.zeros(C, ph, pw, dtype=torch.float32)
-            geo_t  = torch.zeros(3, ph, pw, dtype=torch.float32)
+            # geo_t  = torch.zeros(3, ph, pw, dtype=torch.float32)
+            geo_t = torch.zeros(2, ph, pw, dtype=torch.float32)
             lbl_t  = torch.full((4, ph, pw), float("nan"), dtype=torch.float32)
             return agri_t, geo_t, lbl_t
 
@@ -409,7 +411,8 @@ class AGRIMyd06Dataset(Dataset):
         lbl = np.stack([CLP, CER, COT, CTH], axis=-1)   # (ph, pw, 4)
         lbl[..., 1:] = (lbl[..., 1:] - self.stats.out_mean[1:]) / (self.stats.out_std[1:] + 1e-8)
 
-        geo = np.stack([lat, lon, ele], axis=-1)
+        # geo = np.stack([lat, lon, ele], axis=-1)
+        geo = np.stack([lat, lon], axis=-1)
         geo = np.nan_to_num(geo, nan=0.0)
 
         # ── Data augmentation (train only) ────────────────────────────────

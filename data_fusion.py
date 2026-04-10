@@ -270,7 +270,8 @@ def _read_agri_latlon_vza_sza_ele(geo_file: Path):
             default=np.zeros_like(lat, dtype=np.float32)
         ).astype(np.float32)
 
-    for arr in [lat, lon, vza, sza, ele]:
+    # for arr in [lat, lon, vza, sza, ele]:
+    for arr in [lat, lon, vza, sza]:
         arr[(arr > 1e4) | (arr < -1e4)] = np.nan
 
     if np.isfinite(vza).any() and np.nanmax(np.abs(vza)) > 180:
@@ -279,7 +280,7 @@ def _read_agri_latlon_vza_sza_ele(geo_file: Path):
         sza /= 100.0
 
     lon = _wrap_lon(lon)
-    return lat, lon, vza, sza, ele
+    return lat, lon, vza, sza
 
 
 def read_agri_scene(agri_file: Path) -> Optional[dict]:
@@ -292,7 +293,8 @@ def read_agri_scene(agri_file: Path) -> Optional[dict]:
             log.warning("Paired GEO file not found for %s", agri_file.name)
             return None
 
-        lat, lon, vza, sza, ele = _read_agri_latlon_vza_sza_ele(geo_file)
+        # lat, lon, vza, sza, ele = _read_agri_latlon_vza_sza_ele(geo_file)
+        lat, lon, vza, sza = _read_agri_latlon_vza_sza_ele(geo_file)
 
         bt_list = []
         with h5py.File(agri_file, "r") as ff:
@@ -333,7 +335,8 @@ def read_agri_scene(agri_file: Path) -> Optional[dict]:
             log.warning("No valid lat/lon for %s", agri_file.name)
             return None
 
-        return dict(lat=lat, lon=lon, VZA=vza, SZA=sza, ELE=ele, BT=BT)
+        # return dict(lat=lat, lon=lon, VZA=vza, SZA=sza, ELE=ele, BT=BT)
+        return dict(lat=lat, lon=lon, VZA=vza, SZA=sza, BT=BT)
 
     except Exception as exc:
         log.warning("Failed to read AGRI %s: %s", agri_file, exc)
@@ -499,8 +502,8 @@ def write_paired_hdf5(out_path: Path, agri: dict, labels: dict, agri_dt: datetim
         geo.create_dataset("VZA", data=agri["VZA"], compression="gzip", compression_opts=4)
         geo.create_dataset("SZA", data=agri["SZA"], compression="gzip", compression_opts=4)
 
-        aux = f.create_group("AGRI/Aux")
-        aux.create_dataset("ELE", data=agri["ELE"], compression="gzip", compression_opts=4)
+        # aux = f.create_group("AGRI/Aux")
+        # aux.create_dataset("ELE", data=agri["ELE"], compression="gzip", compression_opts=4)
 
         bt_grp = f.create_group("AGRI/BT")
         for ci, ch_idx in enumerate(cfg.AGRI_BT_CHANNEL_INDICES):
@@ -813,13 +816,14 @@ def _generate_qc_from_h5(h5_path: Path, qc_path: Path, agri_dt: datetime) -> Non
             lon = f["AGRI/Geolocation/lon"][()]
             vza = f["AGRI/Geolocation/VZA"][()]
             sza = f["AGRI/Geolocation/SZA"][()]
-            ele = f["AGRI/Aux/ELE"][()]
+            # ele = f["AGRI/Aux/ELE"][()]
             CLP = f["Labels/CLP"][()]
             CER = f["Labels/CER"][()]
             COT = f["Labels/COT"][()]
             CTH = f["Labels/CTH"][()]
 
-        agri   = dict(lat=lat, lon=lon, VZA=vza, SZA=sza, ELE=ele, BT=BT)
+        # agri   = dict(lat=lat, lon=lon, VZA=vza, SZA=sza, ELE=ele, BT=BT)
+        agri   = dict(lat=lat, lon=lon, VZA=vza, SZA=sza, BT=BT)
         labels = dict(CLP=CLP, CER=CER, COT=COT, CTH=CTH)
         _make_qc_figure(agri, labels, agri_dt, qc_path)
 
