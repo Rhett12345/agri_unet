@@ -47,24 +47,6 @@ def _seed_everything(seed: int = cfg.RANDOM_SEED):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data augmentation (geometric only – safe for all channels)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _augment(agri: torch.Tensor, lbl: torch.Tensor):
-    if random.random() < 0.5:
-        agri = torch.flip(agri, dims=[3])
-        lbl  = torch.flip(lbl,  dims=[3])
-    if random.random() < 0.5:
-        agri = torch.flip(agri, dims=[2])
-        lbl  = torch.flip(lbl,  dims=[2])
-    k = random.randint(0, 3)
-    if k:
-        agri = torch.rot90(agri, k=k, dims=[2, 3])
-        lbl  = torch.rot90(lbl,  k=k, dims=[2, 3])
-    return agri, lbl
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Loss helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -113,8 +95,17 @@ def _batch_metrics(clp_logits, comp_out, labels, stats: NormStats, device):
     valid_clp = torch.isfinite(clp_true) & (clp_true >= 0) & (clp_true < cfg.CLP_CLASSES)
     if valid_clp.any():
         oa = (clp_pred[valid_clp] == clp_true[valid_clp].long()).float().mean().item() * 100.0
+        per_class_acc = []
+        for c in range(cfg.CLP_CLASSES):
+            c_mask = valid_clp & (clp_true == c)
+            if c_mask.any():
+                acc = (clp_pred[c_mask] == c).float().mean().item() * 100.0
+            else:
+                acc = -1.0
+            per_class_acc.append(acc)
     else:
         oa = 0.0
+        per_class_acc = [-1.0] * cfg.CLP_CLASSES
 
     out_std  = torch.from_numpy(stats.out_std[1:]).to(device).reshape(1, 3, 1, 1)
     out_mean = torch.from_numpy(stats.out_mean[1:]).to(device).reshape(1, 3, 1, 1)
@@ -128,12 +119,15 @@ def _batch_metrics(clp_logits, comp_out, labels, stats: NormStats, device):
             return torch.sqrt(torch.mean((a[valid] - b[valid]) ** 2)).item()
         return 0.0
 
-    return (
-        oa,
-        rmse_masked(pred_dn[:, 0], true_dn[:, 0]),
-        rmse_masked(pred_dn[:, 1], true_dn[:, 1]),
-        rmse_masked(pred_dn[:, 2], true_dn[:, 2]),
-    )
+    result = {
+        "oa": oa,
+        "cer_rmse": rmse_masked(pred_dn[:, 0], true_dn[:, 0]),
+        "cot_rmse": rmse_masked(pred_dn[:, 1], true_dn[:, 1]),
+        "cth_rmse": rmse_masked(pred_dn[:, 2], true_dn[:, 2]),
+    }
+    for c in range(cfg.CLP_CLASSES):
+        result[f"cls{c}_acc"] = per_class_acc[c]
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Epoch runners
@@ -147,18 +141,18 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
     training = optimizer is not None
     model.train(training)
 
-    totals = dict(loss=0, clp=0, cer=0, cot=0, cth=0,
-                  oa=0, cer_rmse=0, cot_rmse=0, cth_rmse=0, n=0)
+    totals = {"loss": 0.0, "clp": 0.0, "cer": 0.0, "cot": 0.0, "cth": 0.0,
+              "oa": 0.0, "cer_rmse": 0.0, "cot_rmse": 0.0, "cth_rmse": 0.0, "n": 0}
+    for c in range(cfg.CLP_CLASSES):
+        totals[f"cls{c}_acc"] = 0.0
 
-    for agri, _geo, labels in loader:
+    for agri, geo, labels in loader:
         agri   = agri.to(device)
+        geo    = geo.to(device)
         labels = labels.to(device)
 
-        # if training:
-        #     agri, labels = _augment(agri, labels)
-
         with autocast(enabled=(scaler is not None)):
-            clp_logits, comp_out = model(agri)
+            clp_logits, comp_out = model(agri, geo=geo)
             total, l_clp, l_cer, l_cot, l_cth = _compute_losses(
                 clp_logits, comp_out, labels, ce_fn, reg_fn
             )
@@ -176,7 +170,7 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
                 optimizer.step()
 
-        oa, cer_r, cot_r, cth_r = _batch_metrics(clp_logits, comp_out, labels, stats, device)
+        m = _batch_metrics(clp_logits, comp_out, labels, stats, device)
 
         B = agri.shape[0]
         totals["loss"]     += total.item()  * B
@@ -184,14 +178,17 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
         totals["cer"]      += l_cer.item()  * B
         totals["cot"]      += l_cot.item()  * B
         totals["cth"]      += l_cth.item()  * B
-        totals["oa"]       += oa            * B
-        totals["cer_rmse"] += cer_r         * B
-        totals["cot_rmse"] += cot_r         * B
-        totals["cth_rmse"] += cth_r         * B
+        totals["oa"]       += m["oa"]       * B
+        totals["cer_rmse"] += m["cer_rmse"] * B
+        totals["cot_rmse"] += m["cot_rmse"] * B
+        totals["cth_rmse"] += m["cth_rmse"] * B
+        for c in range(cfg.CLP_CLASSES):
+            totals[f"cls{c}_acc"] += max(0.0, m[f"cls{c}_acc"]) * B
         totals["n"]        += B
 
     N = max(totals["n"], 1)
-    return {k: v / N for k, v in totals.items() if k != "n"}
+    result = {k: v / N for k, v in totals.items() if k != "n"}
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,20 +209,43 @@ def train(stats: NormStats):
     log.info("val iters/epoch   = %d", len(val_dl))
 
     model     = build_model().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=cfg.LR_FACTOR,
         patience=cfg.LR_PATIENCE, min_lr=cfg.MIN_LR
     )
     scaler = GradScaler() if torch.cuda.is_available() else None
 
-    ce_fn  = nn.CrossEntropyLoss(ignore_index=-100)
+    log.info("Computing CLP class distribution from training set ...")
+    class_counts = torch.zeros(cfg.CLP_CLASSES, dtype=torch.float32)
+    for _, _, labels in train_dl:
+        clp = labels[:, 0]
+        valid = torch.isfinite(clp) & (clp >= 0) & (clp < cfg.CLP_CLASSES)
+        for c in range(cfg.CLP_CLASSES):
+            class_counts[c] += (valid & (clp == c)).sum().item()
+    total = class_counts.sum()
+    pcts = [(class_counts[c] / total * 100).item() for c in range(cfg.CLP_CLASSES)]
+    log.info("CLP class distribution: %s",
+             " | ".join(f"c{c}={pcts[c]:.1f}%" for c in range(cfg.CLP_CLASSES)))
+
+    class_weights = torch.ones(cfg.CLP_CLASSES, dtype=torch.float32)
+    valid_classes = class_counts > 0
+    if valid_classes.any():
+        freq = class_counts[valid_classes] / class_counts[valid_classes].sum().clamp_min(1.0)
+        class_weights[valid_classes] = torch.sqrt(freq.mean() / freq.clamp_min(1e-6))
+    log.info("CLP loss weights: %s",
+             " | ".join(f"c{c}={class_weights[c].item():.2f}" for c in range(cfg.CLP_CLASSES)))
+
+    ce_fn  = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights.to(device))
     reg_fn = nn.SmoothL1Loss()
 
     best_val_loss = float("inf")
+    best_val_oa   = 0.0
+    epochs_no_best = 0
     log_rows      = []
 
     cfg.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, cfg.NUM_EPOCHS + 1):
         t0 = time.time()
@@ -238,25 +258,35 @@ def train(stats: NormStats):
         lr_now = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
 
+        cls_str = " ".join(
+            f"c{c}={val_m.get(f'cls{c}_acc', -1):.1f}"
+            for c in range(cfg.CLP_CLASSES) if val_m.get(f"cls{c}_acc", -1) >= 0
+        )
         log.info(
             "Epoch %3d/%d | TrainLoss=%.4f (CLP=%.4f CER=%.4f COT=%.4f CTH=%.4f) "
             "| ValLoss=%.4f | OA=%.2f%% | CER_RMSE=%.2f COT_RMSE=%.2f CTH_RMSE=%.1f "
-            "| LR=%.2e | %.1fs",
+            "| LR=%.2e | %s | %.1fs",
             epoch, cfg.NUM_EPOCHS,
             train_m["loss"], train_m["clp"], train_m["cer"],
             train_m["cot"],  train_m["cth"],
             val_m["loss"], val_m["oa"],
             val_m["cer_rmse"], val_m["cot_rmse"], val_m["cth_rmse"],
-            lr_now, elapsed
+            lr_now, cls_str, elapsed
         )
 
         # ── Checkpoints ───────────────────────────────────────────────────
-        torch.save(model.state_dict(), cfg.CHECKPOINT_LAST)
-        if val_m["loss"] < best_val_loss:
+        is_best = val_m["loss"] < best_val_loss
+        if is_best:
             best_val_loss = val_m["loss"]
+            best_val_oa   = val_m["oa"]
+            epochs_no_best = 0
             torch.save(model.state_dict(), cfg.CHECKPOINT_BEST)
-            log.info("  ✓ New best val loss: %.6f → saved %s",
-                     best_val_loss, cfg.CHECKPOINT_BEST.name)
+            log.info("  ✓ New best val loss: %.6f (OA=%.2f%%) → saved %s",
+                     best_val_loss, best_val_oa, cfg.CHECKPOINT_BEST.name)
+        else:
+            epochs_no_best += 1
+
+        torch.save(model.state_dict(), cfg.CHECKPOINT_LAST)
 
         # ── CSV log ───────────────────────────────────────────────────────
         row = dict(epoch=epoch, lr=lr_now, **{f"train_{k}": v for k, v in train_m.items()},
@@ -264,4 +294,11 @@ def train(stats: NormStats):
         log_rows.append(row)
         pd.DataFrame(log_rows).to_csv(cfg.LOG_DIR / "train_log.csv", index=False)
 
-    log.info("Training complete. Best val loss: %.6f", best_val_loss)
+        # ── Early stopping ────────────────────────────────────────────────
+        if epochs_no_best >= cfg.EARLY_STOP_PATIENCE:
+            log.info("Early stopping at epoch %d (no improvement for %d epochs)",
+                     epoch, epochs_no_best)
+            break
+
+    log.info("Training complete. Best val loss: %.6f, best val OA: %.2f%%",
+             best_val_loss, best_val_oa)

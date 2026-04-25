@@ -6,7 +6,7 @@ AGRI 和 MYD06 文件读取 + HDF5 写出，与聚合逻辑完全解耦。
 主要函数
 --------
   read_agri_scene(path)   → dict(lat, lon, VZA, SZA, BT)
-  read_myd06(path)        → dict(lat_5km, lon_5km, CLP_1km, CER_1km, COT_1km,
+  read_myd06(path)        → dict(lat_5km, lon_5km, lat_1km, lon_1km, CLP_1km, CER_1km, COT_1km,
                                   CTH_5km, scan_time_1km, _dt_min, ...)
   write_fused_hdf5(...)   → 写出 samples_v2 格式 HDF5
 
@@ -79,6 +79,19 @@ def find_matching_modis(agri_dt: datetime, modis_files: list) -> list:
         if mdt and abs(mdt - agri_dt) <= td:
             candidates.append((abs(mdt - agri_dt), f))
     return [f for _, f in sorted(candidates)]
+
+
+def find_matching_myd03(myd06_file: Path, myd03_files: list) -> Optional[Path]:
+    """返回与 MYD06 文件名时间相同的 MYD03 1km 经纬度文件。"""
+    myd06_dt = parse_modis_datetime(myd06_file.name)
+    if myd06_dt is None:
+        return None
+    candidates = []
+    for f in myd03_files:
+        mdt = parse_modis_datetime(f.name)
+        if mdt == myd06_dt:
+            candidates.append(f)
+    return sorted(candidates)[0] if candidates else None
 
 
 # ---------------------------------------------------------------------------
@@ -408,30 +421,26 @@ def _apply_qa_filter(
 
     return dict(CLP=clp, CER=cer, COT=cot, CTH=cth)
 
-    # 1km Cloud Mask -> CLP/CER/COT
-    if cm_1km is not None and cm_1km.shape == clp.shape:
-        ok = np.isin(cm_1km, np.asarray(cfg.MODIS_ALLOWED_CLOUD_MASK_FLAGS_1KM))
-        clp[~ok] = np.nan
-        cer[~ok] = np.nan
-        cot[~ok] = np.nan
-    # 5km Cloud Mask -> CTH
-    if cm_5km is not None and cm_5km.shape == cth.shape:
-        ok5 = np.isin(cm_5km, np.asarray(cfg.MODIS_ALLOWED_CLOUD_MASK_FLAGS_5KM))
-        cth[~ok5] = np.nan
-    # 不确定度过滤
-    if cer_unc is not None and cer_unc.shape == cer.shape:
-        cer[(~np.isfinite(cer_unc)) | (cer_unc > cfg.MODIS_MAX_CER_UNCERTAINTY_PCT)] = np.nan
-    if cot_unc is not None and cot_unc.shape == cot.shape:
-        cot[(~np.isfinite(cot_unc)) | (cot_unc > cfg.MODIS_MAX_COT_UNCERTAINTY_PCT)] = np.nan
 
-    return dict(CLP=clp, CER=cer, COT=cot, CTH=cth)
+def read_myd03(myd03_file: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """读取 MYD03 1km Latitude / Longitude。"""
+    try:
+        sd = SD(str(myd03_file), SDC.READ)
+        lat_1km = sd.select("Latitude")[:].astype(np.float32)
+        lon_1km = sd.select("Longitude")[:].astype(np.float32)
+        sd.end()
+        return lat_1km, lon_1km
+    except Exception as exc:
+        log.warning("read_myd03 failed %s: %s", myd03_file, exc)
+        return None
 
 
-def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None) -> Optional[dict]:
+def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None, myd03_file: Optional[Path] = None) -> Optional[dict]:
     """
     读取 MYD06 文件，返回保留 2D 空间形状的变量字典。
 
-    当前配置下 4 个主监督量都按 1km SDS 处理；若产品只提供 5km 经纬度，
+    当前配置下 4 个主监督量都按 1km SDS 处理；若传入 MYD03 则使用其 1km 经纬度，
+    否则若产品只提供 5km 经纬度，
     则在聚合阶段按现有逻辑上采样到 1km 标签形状。
     """
     try:
@@ -466,6 +475,20 @@ def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None) -> Optional
 
         sd.end()
 
+        lat_1km = None
+        lon_1km = None
+        if myd03_file is not None:
+            geo_1km = read_myd03(myd03_file)
+            if geo_1km is not None:
+                lat_1km, lon_1km = geo_1km
+                if lat_1km.shape != clp_1km.shape or lon_1km.shape != clp_1km.shape:
+                    log.warning(
+                        "MYD03 shape mismatch %s: lat=%s lon=%s label=%s; fallback to MYD06 5km geo",
+                        myd03_file.name, lat_1km.shape, lon_1km.shape, clp_1km.shape,
+                    )
+                    lat_1km = None
+                    lon_1km = None
+
         filt = _apply_qa_filter(
             clp_1km,
             cer_1km,
@@ -494,6 +517,8 @@ def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None) -> Optional
         return dict(
             lat_5km=lat_5km,
             lon_5km=lon_5km,
+            lat_1km=lat_1km,
+            lon_1km=lon_1km,
             CLP_1km=filt["CLP"],
             CER_1km=filt["CER"],
             COT_1km=filt["COT"],

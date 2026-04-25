@@ -91,7 +91,7 @@ class DA_Block(nn.Module):
 
 class TransformerEncoder(nn.Module):
     """Lightweight ViT-style encoder operating on flattened spatial tokens."""
-    def __init__(self, dim: int, depth: int, heads: int, mlp_dim: int, dropout: float = 0.1):
+    def __init__(self, dim: int, depth: int, heads: int, mlp_dim: int, dropout: float = 0.2):
         super().__init__()
         self.layers = nn.ModuleList([
             nn.ModuleList([
@@ -145,6 +145,14 @@ class CloudPropertyNet(nn.Module):
         self.comp_channels = comp_channels
         C = base_ch
 
+        # ── Geo encoder (lat/lon → channel-wise gate) ─────────────────────
+        self.geo_embed = nn.Sequential(
+            nn.Conv2d(2, 8, 1),
+            nn.ReLU(),
+            nn.Conv2d(8, agri_channels, 1),
+            nn.Sigmoid(),
+        )
+
         # ── Encoder ──────────────────────────────────────────────────────
         self.enc1 = self._block(agri_channels, C)
         self.enc2 = self._block(C,     2 * C)
@@ -173,7 +181,7 @@ class CloudPropertyNet(nn.Module):
         # ── CLP-enhance branch ───────────────────────────────────────────
         self.clp_enhance = nn.Sequential(
             nn.Conv2d(clp_classes, comp_channels, 1),
-            nn.BatchNorm2d(comp_channels),
+            nn.GroupNorm(num_groups=1, num_channels=comp_channels),
             nn.ReLU(),
         )
 
@@ -202,13 +210,18 @@ class CloudPropertyNet(nn.Module):
 
     # ── forward ──────────────────────────────────────────────────────────────
 
-    def forward(self, agri: torch.Tensor):
+    def forward(self, agri: torch.Tensor, geo: torch.Tensor = None):
         """
         agri : (B, AGRI_CHANNELS, H, W)
+        geo  : (B, 2, H, W) optional lat/lon
         Returns:
             clp_logits : (B, CLP_CLASSES,   H, W)
             comp_out   : (B, COMP_CHANNELS,  H, W)
         """
+        if geo is not None:
+            geo_gate = self.geo_embed(geo)
+            agri = agri * (1.0 + 0.1 * geo_gate)
+
         # Encoder
         e1 = self.da1(self.enc1(agri))
         e2 = self.da2(self.enc2(F.max_pool2d(e1, 2)))

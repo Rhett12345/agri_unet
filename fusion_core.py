@@ -224,7 +224,7 @@ def aggregate_modis_to_agri(
     算法流程
     --------
     1. 对每个 MYD06 文件：
-       a. 上采样 5km 坐标 → 1km（用于 CLP/CER/COT）
+       a. 优先使用 MYD03 1km 坐标；缺失时上采样 5km 坐标 → 1km（用于 CLP/CER/COT）
        b. 构建 KD-tree（1km 和 5km 分别建）
        c. query_ball_point：找每个 AGRI 像元 footprint 内所有 MYD06 像元
        d. 逐 AGRI 像元收集候选值和时间权重（列表追加）
@@ -441,6 +441,8 @@ def _collect_1km(
     cth_2d = m.get("CTH_1km")
     lat_5  = m.get("lat_5km")
     lon_5  = m.get("lon_5km")
+    lat_1  = m.get("lat_1km")
+    lon_1  = m.get("lon_1km")
     scan_t = m.get("scan_time_1km")   # (H_1km, W_1km) float32 分钟偏移，或 None
 
     if clp_2d is None or lat_5 is None:
@@ -448,8 +450,11 @@ def _collect_1km(
 
     H_1km, W_1km = clp_2d.shape
 
-    # 5km 坐标上采样到 1km（重复，不插值）
-    lat_1km, lon_1km = upsample_5km_to_1km_coords(lat_5, lon_5, (H_1km, W_1km))
+    if lat_1 is not None and lon_1 is not None and lat_1.shape == (H_1km, W_1km) and lon_1.shape == (H_1km, W_1km):
+        lat_1km, lon_1km = lat_1, lon_1
+    else:
+        # 5km 坐标上采样到 1km（重复，不插值）
+        lat_1km, lon_1km = upsample_5km_to_1km_coords(lat_5, lon_5, (H_1km, W_1km))
 
     lat_f = lat_1km.ravel()
     lon_f = lon_1km.ravel()
@@ -513,72 +518,6 @@ def _collect_1km(
         buf_cth_v[k_a].extend(cth_k[nbrs].tolist())
         buf_cth_w[k_a].extend(w_k[nbrs].tolist())
         buf_dt[k_a].extend(dt_k[nbrs].tolist())
-
-
-def _collect_5km(
-    m: dict,
-    a_xyz: np.ndarray,
-    valid_agri: np.ndarray,
-    chord: float,
-    file_dt_min: float,
-    is_fallback: bool,
-    buf_cth_v, buf_cth_w,
-):
-    cth_2d = m.get("CTH_5km")
-    lat_5  = m.get("lat_5km")
-    lon_5  = m.get("lon_5km")
-    scan_t = m.get("scan_time_1km")
-
-    if cth_2d is None or lat_5 is None:
-        return
-
-    lat_f = lat_5.ravel()
-    lon_f = lon_5.ravel()
-    cth_f = cth_2d.ravel()
-
-    # 5km 时间：从 1km scan_time 下采样（取行方向步长）
-    if scan_t is not None:
-        H_1km, W_1km = scan_t.shape
-        H_5km, W_5km = lat_5.shape
-        rh = max(1, round(H_1km / max(H_5km, 1)))
-        st_5 = scan_t[::rh, :][:H_5km, :W_5km]
-        dt_f = np.abs(st_5.ravel()[:len(lat_f)]).astype(np.float32)
-        fallback = False
-    else:
-        dt_f = np.full(len(lat_f), float(file_dt_min), np.float32)
-        fallback = True
-
-    geo_ok  = np.isfinite(lat_f) & np.isfinite(lon_f)
-    time_ok = dt_f <= fc.TIME_LOW_Q_MIN
-    keep = geo_ok & time_ok
-    if keep.sum() == 0:
-        return
-
-    idx_keep = np.where(keep)[0]
-    lat_k = lat_f[idx_keep]
-    lon_k = lon_f[idx_keep]
-    cth_k = cth_f[idx_keep]
-    dt_k  = dt_f[idx_keep]
-
-    w_k = np.where(
-        dt_k <= fc.TIME_HIGH_Q_MIN,
-        1.0,
-        0.5 * (1.0 - (dt_k - fc.TIME_HIGH_Q_MIN) /
-               (fc.TIME_LOW_Q_MIN - fc.TIME_HIGH_Q_MIN))
-    ).astype(np.float32)
-    if fallback:
-        w_k *= fc.SCAN_TIME_FALLBACK_WEIGHT
-
-    m_xyz = latlon_to_xyz(lat_k, lon_k)
-    tree  = cKDTree(m_xyz)
-    nbrs_list = tree.query_ball_point(a_xyz, r=chord, workers=1)
-
-    for k_a, nbrs in enumerate(nbrs_list):
-        if len(nbrs) == 0:
-            continue
-        nbrs = np.asarray(nbrs, dtype=np.int64)
-        buf_cth_v[k_a].extend(cth_k[nbrs].tolist())
-        buf_cth_w[k_a].extend(w_k[nbrs].tolist())
 
 
 # ---------------------------------------------------------------------------

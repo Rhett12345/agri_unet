@@ -41,6 +41,25 @@ from sample_filters import get_patch_supervision_thresholds, patch_passes_superv
 log = logging.getLogger(__name__)
 
 
+def _split_dates_for_mode(mode: str):
+    date_map = {
+        "train": getattr(cfg, "TRAIN_DATES", []),
+        "val": getattr(cfg, "VAL_DATES", []),
+        "test": getattr(cfg, "TEST_DATES", []),
+    }
+    return set(date_map.get(mode, []) or [])
+
+
+def _filter_h5_files_by_dates(h5_files: List[Path], mode: str) -> List[Path]:
+    dates = _split_dates_for_mode(mode)
+    if not dates:
+        return h5_files
+    filtered = [p for p in h5_files if any(part in dates for part in p.parts)]
+    log.info("Using %d/%d %s files after date filter: %s",
+             len(filtered), len(h5_files), mode, ",".join(sorted(dates)))
+    return filtered
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Normalisation statistics I/O
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +184,7 @@ def compute_and_save_stats(
     """
     log.info("Computing normalisation statistics from %s  (workers=%d)", paired_dir, n_workers)
 
-    h5_files = sorted(paired_dir.rglob("*.h5"))
+    h5_files = _filter_h5_files_by_dates(sorted(paired_dir.rglob("*.h5")), "train")
     if not h5_files:
         raise FileNotFoundError(f"No .h5 files found under {paired_dir}")
 
@@ -231,7 +250,7 @@ def compute_and_save_stats(
 
     all_reg = np.concatenate(reservoir, axis=0)   # (N_total, 3)
     q5  = np.concatenate([[0.0], np.percentile(all_reg,  5, axis=0)])
-    q95 = np.concatenate([[4.0], np.percentile(all_reg, 95, axis=0)])
+    q95 = np.concatenate([[float(cfg.CLP_CLASSES - 1)], np.percentile(all_reg, 95, axis=0)])
 
     stats = NormStats(
         agri_mean=agri_mean, agri_std=agri_std,
@@ -351,7 +370,7 @@ class AGRIMyd06Dataset(Dataset):
         geo    : FloatTensor  (3, patch_H, patch_W)  [lat, lon, ELE] – raw
         geo    : FloatTensor  (2, patch_H, patch_W)  [lat, lon] – raw
         labels : FloatTensor  (4, patch_H, patch_W)
-                   ch0 = CLP (float, integer class 0-4)
+                   ch0 = CLP (float, integer class 0-2)
                    ch1 = CER (µm,  z-score normalised, NaN for clear/missing)
                    ch2 = COT (z-score normalised, NaN for clear/missing)
                    ch3 = CTH (m,   z-score normalised, NaN for clear/missing)
@@ -367,7 +386,7 @@ class AGRIMyd06Dataset(Dataset):
         self.mode       = mode
         self.ph, self.pw = patch_size
 
-        h5_files = sorted(paired_dir.rglob("*.h5"))
+        h5_files = _filter_h5_files_by_dates(sorted(paired_dir.rglob("*.h5")), mode)
         if not h5_files:
             raise FileNotFoundError(f"No .h5 files found in {paired_dir}")
 
@@ -433,6 +452,14 @@ class AGRIMyd06Dataset(Dataset):
             lbl_t  = torch.full((4, ph, pw), float("nan"), dtype=torch.float32)
             return agri_t, geo_t, lbl_t
 
+        # ── CLP label remap/QC (supports old 5-class H5 files) ───────────
+        remap = getattr(cfg, "CLP_LABEL_REMAP", None)
+        if remap:
+            remapped_clp = np.full_like(CLP, np.nan, dtype=np.float32)
+            for old_label, new_label in remap.items():
+                remapped_clp[CLP == old_label] = new_label
+            CLP = remapped_clp
+
         # ── Label QC (per-channel NaN masking) ──────────────────────────
         bad_clp = (CLP < 0) | (CLP >= cfg.CLP_CLASSES)
         bad_cer = (CER < 0) | (CER > 100)
@@ -456,7 +483,11 @@ class AGRIMyd06Dataset(Dataset):
         geo = np.stack([lat, lon], axis=-1)
         geo = np.nan_to_num(geo, nan=0.0)
 
-        # ── Data augmentation (train only) ────────────────────────────────
+        # ── Gaussian noise on BTs (train only, simulates sensor noise) ──
+        if self.mode == "train":
+            agri_norm = agri_norm + np.random.randn(*agri_norm.shape).astype(np.float32) * 0.02
+
+        # ── Geometric augmentation (train only) ───────────────────────────
         if self.mode == "train":
             if np.random.rand() < 0.5:
                 agri_norm = np.flip(agri_norm, axis=1).copy()

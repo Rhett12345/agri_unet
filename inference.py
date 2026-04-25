@@ -102,15 +102,19 @@ def run_inference(agri_file: Path,
     lon = agri["lon"]
     H, W, _ = BT.shape
 
+    # ── Normalise BT globally ─────────────────────────────────────────────
+    BT_norm = (BT - stats.agri_mean) / (stats.agri_std + 1e-8)
+
+    # ── Build geo stack (lat, lon normalized to [-1, 1] approx) ──────────
+    geo = np.stack([lat, lon], axis=-1).astype(np.float32)
+    geo = np.nan_to_num(geo, nan=0.0)
+
     # ── Patch geometry ────────────────────────────────────────────────────
     ph, pw   = cfg.PATCH_SIZE
     overlap  = cfg.PATCH_OVERLAP
     stride_h = max(1, ph - overlap)
     stride_w = max(1, pw - overlap)
     wmap     = _gaussian_weight_map(ph, pw)   # (ph, pw)
-
-    # ── Normalise BT globally ─────────────────────────────────────────────
-    BT_norm = (BT - stats.agri_mean) / (stats.agri_std + 1e-8)
 
     # ── Accumulation buffers ──────────────────────────────────────────────
     # CLP: accumulate class probabilities (5 channels)
@@ -120,19 +124,22 @@ def run_inference(agri_file: Path,
     weight_sum  = np.zeros((H, W), dtype=np.float32)
 
     # ── Batch-wise inference ──────────────────────────────────────────────
-    patches_buf, positions_buf = [], []
+    patches_buf, geo_buf, positions_buf = [], [], []
 
-    def _flush(patches_buf, positions_buf):
+    def _flush(patches_buf, geo_buf, positions_buf):
         """Process accumulated patch batch."""
         if not patches_buf:
             return
         x = torch.from_numpy(
             np.stack(patches_buf, axis=0).transpose(0, 3, 1, 2)   # (B, C, ph, pw)
         ).to(device)
+        g = torch.from_numpy(
+            np.stack(geo_buf, axis=0).transpose(0, 3, 1, 2)       # (B, 2, ph, pw)
+        ).to(device)
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                clp_logits, comp_norm = model(x)
+                clp_logits, comp_norm = model(x, geo=g)
 
         clp_prob  = F.softmax(clp_logits, dim=1).cpu().numpy()   # (B, 5, ph, pw)
         comp_dn   = (
@@ -147,6 +154,7 @@ def run_inference(agri_file: Path,
             weight_sum[si:si+ph, sj:sj+pw]  += wmap
 
         patches_buf.clear()
+        geo_buf.clear()
         positions_buf.clear()
 
     for patch, si, sj in _extract_patches(BT_norm, ph, pw, stride_h, stride_w):
@@ -154,15 +162,18 @@ def run_inference(agri_file: Path,
         if nan_ratio > 0.8:
             continue   # skip mostly-missing patches
 
+        geo_patch = geo[si:si+ph, sj:sj+pw, :]
+
         # Fill NaN with channel means before inference (will be masked in output)
         patch_filled = np.where(np.isnan(patch), 0.0, patch)
         patches_buf.append(patch_filled)
+        geo_buf.append(geo_patch)
         positions_buf.append((si, sj))
 
         if len(patches_buf) >= batch_size:
-            _flush(patches_buf, positions_buf)
+            _flush(patches_buf, geo_buf, positions_buf)
 
-    _flush(patches_buf, positions_buf)   # remaining
+    _flush(patches_buf, geo_buf, positions_buf)   # remaining
 
     # ── Stitch ────────────────────────────────────────────────────────────
     clp_prob_map = _stitch(clp_sum,  weight_sum)   # (H, W, 5)

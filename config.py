@@ -11,15 +11,18 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  Root directories
 # ─────────────────────────────────────────────────────────────────────────────
-ROOT = Path("/data/Data_yuq/unet_workdir")           # Change to your project root
+# ROOT = Path("/data/Data_yuq/unet_workdir")           # Change to your project root
+ROOT = Path("/home/yuq/cloudmask/unet/unet_workdir")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Raw data – folder-per-day layout
 #     AGRI_ROOT/<YYYYMMDD>/*.HDF   (FY-4B AGRI FDI / GEO L1 files)
 #     MODIS_ROOT/<YYYYMMDD>/*.hdf  (MYD06 cloud product files)
+#     MYD03_ROOT/<YYYYMMDD>/*.hdf  (MYD03 1km geolocation files)
 # ─────────────────────────────────────────────────────────────────────────────
 AGRI_ROOT  = Path("/data/Data_yuq/FY4A/")          # parent directory of day-folders
 MODIS_ROOT = Path("/data/Data_yuq/MYD06/")         # parent directory of day-folders
+MYD03_ROOT = Path("/data/Data_yuq/MYD03/")         # parent directory of day-folders
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Paired HDF output (produced by data_fusion.py)
@@ -81,12 +84,15 @@ MODIS_SCALE = {
     "CTH": 1.0,      # already in metres
 }
 
-# IR phase → training phase space (0=clear, 1=water, 2=supercool, 3=mixed, 4=ice)
-# 注意：Cloud_Phase_Infrared_1km 本身不提供 supercool 类，因此当前标签不会覆盖 class=2。
-MODIS_PHASE_MAP = {0: 0, 1: 1, 2: 4, 3: 3, 4: -1, 5: -1, 6: -1}
+# IR phase → training phase space (0=clear, 1=water, 2=ice)
+# 临时三分类设置：Cloud_Phase_Infrared_1km 中未稳定覆盖的 supercool/mixed
+# 不作为单独训练类别；旧融合文件中的 ice=4 会在 dataset.py 中重映射为 ice=2。
+CLP_CLASS_NAMES = ["Clear", "Water", "Ice"]
+CLP_LABEL_REMAP = {0: 0, 1: 1, 2: 2, 4: 2}
+MODIS_PHASE_MAP = {0: 0, 1: 1, 2: 2, 3: -1, 4: -1, 5: -1, 6: -1}
 
 # Optical phase (QC only) mapped to the same phase space when需要一致性检查。
-MODIS_OPTICAL_PHASE_MAP = {0: -1, 1: 0, 2: 1, 3: 4, 4: -1}
+MODIS_OPTICAL_PHASE_MAP = {0: -1, 1: 0, 2: 1, 3: 2, 4: -1}
 
 # Maximum spatial distance (km) allowed when snapping MODIS pixel to AGRI pixel
 MAX_MATCH_DIST_KM = 3.0
@@ -115,8 +121,18 @@ PATCH_FILTER_RULES = {
         "min_valid_cloudy_ratio": 0.125,
     },
     "train": {},
-    "val": {},
-    "test": {},
+    "val": {
+        "min_valid_label_pixels": 128,
+        "min_valid_label_ratio": 0.125,
+        "min_valid_cloudy_pixels": 64,
+        "min_valid_cloudy_ratio": 0.0625,
+    },
+    "test": {
+        "min_valid_label_pixels": 128,
+        "min_valid_label_ratio": 0.125,
+        "min_valid_cloudy_pixels": 64,
+        "min_valid_cloudy_ratio": 0.0625,
+    },
 }
 
 # 融合输出只保留有监督样本，不再把整幅全圆盘直接写入训练 HDF5。
@@ -160,36 +176,11 @@ PATCH_OVERLAP = 16          # pixels overlap used in inference sliding window
 
 # Train / val / test date split  (folder names, YYYYMMDD)
 # Leave empty lists to use ALL available days in each split dir.
-TRAIN_DATES = [
-    "20190105", "20190115",
-    "20190205", "20190215",
-    "20190305", "20190315",
-    "20190405", "20190415",
-    "20190505", "20190515",
-    "20190605", "20190615",
-    # "20190705", "20190715",
-    # "20190805", "20190815",
-    # "20190905", "20190915",
-    # "20191005", "20191015",
-    # "20191105", "20191115",
-    # "20191205", "20191215",
-]   # e.g. ["20230601", "20230602", ...]
-VAL_DATES   = [
-    "20190125",
-    "20190325",
-    "20190525",
-    # "20190725",
-    # "20190925",
-    # "20191125",
-]
-TEST_DATES  = [
-    "20190225",
-    "20190425",
-    "20190625",
-    # "20190825",
-    # "20191025",
-    # "20191225",
-]
+# Small diagnostic split for the current 3-class experiment.
+# Leave empty lists to use all available days under each paired split directory.
+TRAIN_DATES = ["20190105", "20190115", "20190205"]
+VAL_DATES   = ["20190125"]
+TEST_DATES  = ["20190225"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8.  Model hyper-parameters
@@ -198,7 +189,7 @@ TEST_DATES  = [
 AGRI_CHANNELS  = len(AGRI_BT_CHANNEL_INDICES)   # 9
 GIIRS_CHANNELS = 0                               # not used
 
-CLP_CLASSES   = 5
+CLP_CLASSES   = len(CLP_CLASS_NAMES)
 COMP_CHANNELS = 3   # CER, COT, CTH
 
 MODEL_BASE_CHANNELS = 32
@@ -210,13 +201,16 @@ TRANSFORMER_MLP_DIM = 256
 # 9.  Training hyper-parameters
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE    = 32
-NUM_EPOCHS    = 50
+NUM_EPOCHS    = 30
 LEARNING_RATE = 1e-4
-LR_PATIENCE   = 12
+LR_PATIENCE   = 6
 LR_FACTOR     = 0.5
 MIN_LR        = 1e-6
 GRAD_CLIP     = 1.0
 NUM_WORKERS   = 4
+
+# Early stopping
+EARLY_STOP_PATIENCE = 10
 
 # Loss weights  (CLP_CE + w_cer*CER + w_cot*COT + w_cth*CTH)
 # 原来 CLP=0.5 被回归任务淹没，改为等权；待模型收敛后可再调整

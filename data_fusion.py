@@ -33,7 +33,7 @@ import config as cfg
 import fusion_config as fc
 from fusion_core import aggregate_modis_to_agri
 from fusion_io import (
-    apply_quality_filter, find_day_folders, find_matching_modis,
+    apply_quality_filter, find_day_folders, find_matching_modis, find_matching_myd03,
     parse_agri_datetime, parse_modis_datetime,
     read_agri_scene, read_myd06,
     write_fused_samples, write_full_disk_hdf5,
@@ -62,8 +62,14 @@ def _fuse_one_scene(agri_file, modis_files, out_path, mode):
             return False, out_path, "read_agri_scene None"
 
         modis_list = []
-        for mf in [Path(p) for p in modis_files]:
-            m = read_myd06(mf, agri_dt=agri_dt)
+        for item in modis_files:
+            if isinstance(item, (list, tuple)):
+                mf = Path(item[0])
+                myd03_file = Path(item[1]) if len(item) > 1 and item[1] else None
+            else:
+                mf = Path(item)
+                myd03_file = None
+            m = read_myd06(mf, agri_dt=agri_dt, myd03_file=myd03_file)
             if m is None:
                 continue
             mdt = parse_modis_datetime(mf.name)
@@ -143,8 +149,10 @@ def _make_qc_figure(out_h5: Path, qc_path: Path):
                 BT_keys = sorted(f["AGRI/BT"].keys())
                 bt0 = f[f"AGRI/BT/{BT_keys[0]}"][()]
 
-                clp_cmap = ListedColormap(["white","deepskyblue","cyan","orange","red"])
-                clp_norm = BoundaryNorm([-0.5,0.5,1.5,2.5,3.5,4.5], clp_cmap.N)
+                clp_names = list(getattr(cfg, "CLP_CLASS_NAMES", ["Clear", "Water", "Ice"]))
+                clp_cmap = ListedColormap(["white", "deepskyblue", "red"][:len(clp_names)])
+                clp_ticks = list(range(len(clp_names)))
+                clp_norm = BoundaryNorm(np.arange(len(clp_names) + 1) - 0.5, clp_cmap.N)
                 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
                 fbt = bt0[np.isfinite(bt0)]
@@ -166,8 +174,8 @@ def _make_qc_figure(out_h5: Path, qc_path: Path):
                 cmap_p = clp_cmap.copy(); cmap_p.set_bad("lightgrey")
                 im3 = axes[1,0].imshow(np.where(np.isfinite(CLP),CLP,np.nan),
                     cmap=cmap_p, norm=clp_norm, aspect="auto", interpolation="none")
-                cb = plt.colorbar(im3, ax=axes[1,0], ticks=[0,1,2,3,4])
-                cb.ax.set_yticklabels(["Clear","Water","Supercool","Mixed","Ice"], fontsize=8)
+                cb = plt.colorbar(im3, ax=axes[1,0], ticks=clp_ticks)
+                cb.ax.set_yticklabels(clp_names, fontsize=8)
                 axes[1,0].set_title("MODIS Phase (多数表决)")
 
                 cloudy = np.isfinite(CLP) & (CLP>0) & np.isfinite(CTH)
@@ -200,6 +208,7 @@ def fuse_day(
     agri_day_dir: Path,
     modis_day_dir: Path,
     out_dir: Path,
+    myd03_day_dir: Path = None,
     mode: str = "train",
     overwrite: bool = False,
     max_qc: int = 3,
@@ -213,8 +222,14 @@ def fuse_day(
         list(modis_day_dir.glob("MYD06*.hdf")) +
         list(modis_day_dir.glob("MYD06*.HDF"))
     )
-    log.info("Day %s | AGRI=%d MYD06=%d | workers=%d",
-             agri_day_dir.name, len(agri_files), len(modis_files), n_workers)
+    myd03_files = []
+    if myd03_day_dir is not None and myd03_day_dir.is_dir():
+        myd03_files = sorted(
+            list(myd03_day_dir.glob("MYD03*.hdf")) +
+            list(myd03_day_dir.glob("MYD03*.HDF"))
+        )
+    log.info("Day %s | AGRI=%d MYD06=%d MYD03=%d | workers=%d",
+             agri_day_dir.name, len(agri_files), len(modis_files), len(myd03_files), n_workers)
 
     if not agri_files:
         return 0
@@ -227,11 +242,12 @@ def fuse_day(
         matched = find_matching_modis(agri_dt, modis_files)
         if not matched:
             continue
+        matched = [(str(f), str(find_matching_myd03(f, myd03_files) or "")) for f in matched]
         out_name = f"AGRI_MYD06_{agri_dt:%Y%m%d_%H%M%S}.h5"
         out_path = out_dir / out_name
         if out_path.exists() and not overwrite:
             continue
-        tasks.append((str(agri_file), [str(f) for f in matched], str(out_path), mode))
+        tasks.append((str(agri_file), matched, str(out_path), mode))
 
     if not tasks:
         log.info("Day %s - no tasks", agri_day_dir.name)
@@ -275,7 +291,9 @@ def fuse_day(
 def fuse_day_compat(agri_day, modis_day, out_sub, overwrite=False, max_qc=3):
     parts = {p.lower() for p in out_sub.parts}
     mode = "val" if ("val" in parts or "valid" in parts) else ("test" if "test" in parts else "train")
+    myd03_day = cfg.MYD03_ROOT / agri_day.name
     return fuse_day(agri_day, modis_day, out_sub, mode=mode,
+                    myd03_day_dir=myd03_day,
                     overwrite=overwrite, max_qc=max_qc)
 
 
@@ -304,6 +322,7 @@ def main():
 
     agri_days  = find_day_folders(cfg.AGRI_ROOT, dates)
     modis_days = {d.name: d for d in find_day_folders(cfg.MODIS_ROOT, dates)}
+    myd03_days = {d.name: d for d in find_day_folders(cfg.MYD03_ROOT, dates)}
 
     total = 0
     for agri_day in agri_days:
@@ -311,7 +330,11 @@ def main():
         if modis_day is None:
             log.warning("No MODIS for %s", agri_day.name)
             continue
+        myd03_day = myd03_days.get(agri_day.name)
+        if myd03_day is None:
+            log.warning("No MYD03 for %s; fallback to MYD06 5km geo", agri_day.name)
         total += fuse_day(agri_day, modis_day, split_out / agri_day.name,
+                          myd03_day_dir=myd03_day,
                           mode=args.split, overwrite=args.overwrite,
                           max_qc=args.max_qc, n_workers=args.workers)
 

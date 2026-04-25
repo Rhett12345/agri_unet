@@ -35,7 +35,7 @@ from model import build_model
 
 log = logging.getLogger(__name__)
 
-PHASE_NAMES = ["Clear", "Water", "Supercool", "Mixed", "Ice"]
+PHASE_NAMES = list(getattr(cfg, "CLP_CLASS_NAMES", ["Clear", "Water", "Ice"]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,11 +126,12 @@ def evaluate(stats: NormStats, checkpoint: Optional[Path] = None):
     out_mean = torch.from_numpy(stats.out_mean[1:]).to(device).reshape(1, 3, 1, 1)
 
     with torch.no_grad():
-        for agri, _geo, labels in test_dl:
+        for agri, geo, labels in test_dl:
             agri   = agri.to(device)
+            geo    = geo.to(device)
             labels = labels.to(device)
 
-            clp_logits, comp_norm = model(agri)
+            clp_logits, comp_norm = model(agri, geo=geo)
 
             # De-normalise
             comp_dn = comp_norm * out_std + out_mean

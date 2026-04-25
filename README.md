@@ -123,7 +123,7 @@ ROOT/
 /AGRI/BT/ch{NN}                           float32 (H, W)   brightness temperature (K)
 /Labels/{CLP, CER, COT, CTH}             float32 (H, W)
 ```
-`CLP` is an integer class (0=clear, 1=water, 2=supercool, 3=mixed, 4=ice).
+`CLP` is an integer class (temporary 3-class setup: 0=clear, 1=water, 2=ice).
 `CER` in µm, `COT` dimensionless, `CTH` in metres.
 
 ---

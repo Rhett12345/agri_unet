@@ -67,17 +67,22 @@ def stage_fuse(args):
 
     agri_days  = _find_day_folders(cfg.AGRI_ROOT, dates)
     modis_days = {d.name: d for d in _find_day_folders(cfg.MODIS_ROOT, dates)}
+    myd03_days = {d.name: d for d in _find_day_folders(cfg.MYD03_ROOT, dates)}
 
     for agri_day in agri_days:
         modis_day = modis_days.get(agri_day.name)
         if modis_day is None:
             log.warning("No MODIS folder for %s - skipping", agri_day.name)
             continue
+        myd03_day = myd03_days.get(agri_day.name)
+        if myd03_day is None:
+            log.warning("No MYD03 folder for %s - fallback to MYD06 5km geo", agri_day.name)
         out_sub = split_out[split] / agri_day.name
         fuse_day(
             agri_day_dir=agri_day,
             modis_day_dir=modis_day,
             out_dir=out_sub,
+            myd03_day_dir=myd03_day,
             mode=split,
             overwrite=getattr(args, "overwrite", False),
             max_qc=getattr(args, "max_qc", 3),
