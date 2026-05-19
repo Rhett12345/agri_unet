@@ -77,54 +77,84 @@ def radiance_to_bt(rad: np.ndarray, wl_um: float) -> np.ndarray:
 # 转换系数
 # ═══════════════════════════════════════════════════════════════════
 
-def load_b2a_coeffs(csv_path: str) -> Dict[int, Tuple[str, float, float, float]]:
-    """加载 FY-4B → FY-4A 转换系数，key = B 物理通道号。"""
+def load_b2a_coeffs(csv_path: str) -> Dict[int, dict]:
+    """加载 FY-4B → FY-4A 转换系数，含 Planck 订正 S_t/Q_t/S_r/Q_r。
+
+    Returns
+    -------
+    dict key=物理通道号, value=dict with:
+        model_type, c1, c2, intercept,
+        S_t, Q_t, S_r, Q_r  (default 1,0,1,0)
+    """
     coeffs = {}
     with open(csv_path) as f:
         for row in csv.DictReader(f):
             if row["Direction"] != "B2A":
                 continue
             src_ch = int(row["Source_Ch"].split("ch")[1])
-            model_type = row.get("Model", "linear").strip()
-            c1 = float(row["Coeff_1"]) if row.get("Coeff_1", "").strip() else 0.0
-            c2 = float(row["Coeff_2"]) if row.get("Coeff_2", "").strip() else 0.0
-            intercept = float(row["Intercept"]) if row.get("Intercept", "").strip() else 0.0
-            coeffs[src_ch] = (model_type, c1, c2, intercept)
+
+            def _float(col, default=0.0):
+                v = row.get(col, "").strip()
+                return float(v) if v else default
+
+            coeffs[src_ch] = {
+                "model_type": row.get("Model", "linear").strip(),
+                "c1": _float("Coeff_1"),
+                "c2": _float("Coeff_2") if row.get("Coeff_2", "").strip() else None,
+                "intercept": _float("Intercept"),
+                "S_t": _float("S_t", 1.0),   # Planck订正: 目标(B)侧
+                "Q_t": _float("Q_t", 0.0),
+                "S_r": _float("S_r", 1.0),   # Planck订正: 参考(A)侧
+                "Q_r": _float("Q_r", 0.0),
+            }
     return coeffs
 
 
 def convert_channel(val: np.ndarray, ch_b: int, wl_b: Optional[float],
-                    wl_a: Optional[float], coeffs: dict) -> np.ndarray:
+                    wl_a: Optional[float], coeff: dict) -> np.ndarray:
     """
-    单通道 BT 转换：BT_B → Rad_B → 系数转换 → Rad_A → BT_A。
-    若某侧波长未知则直接对 BT 应用系数（非 IR 通道）。
+    单通道转换（含 Planck 单波长订正）：
+
+    BT_B → S_t/Q_t 订正 → Planck → Rad_B → 系数转换 → Rad_A
+         → 逆Planck → BT_A_raw → S_r/Q_r 订正 → BT_A
+
+    订正公式（来自 sensitivity.py）：
+      T_planck = S_t · T_true + Q_t    (源通道 Planck 偏置修正)
+      T_true   = S_r · T_planck + Q_r  (目标通道 Planck 偏置修正)
     """
-    if ch_b not in coeffs:
+    if ch_b not in coeff:
         log.warning("No coeff for B%02d, pass-through", ch_b)
         return val
 
-    model_type, c1, c2, intercept = coeffs[ch_b]
+    c = coeff[ch_b]
+    S_t, Q_t = c["S_t"], c["Q_t"]
+    S_r, Q_r = c["S_r"], c["Q_r"]
     valid = np.isfinite(val)
 
     if wl_b is not None and wl_a is not None:
-        # IR 通道：BT → radiance → 系数 → BT
-        rad_b = bt_to_radiance(val, wl_b)
+        # ① 源通道 BT 订正 → Planck → 辐亮度
+        bt_planck = S_t * val + Q_t
+        rad_b = bt_to_radiance(bt_planck, wl_b)
+
+        # ② 系数转换
         rad_a = np.full_like(rad_b, np.nan, dtype=np.float32)
         v = rad_b[valid]
-        if model_type == "linear":
-            rad_a[valid] = c1 * v + intercept
+        if c["c2"] is not None:
+            rad_a[valid] = c["c2"] * v ** 2 + c["c1"] * v + c["intercept"]
         else:
-            rad_a[valid] = c2 * v ** 2 + c1 * v + intercept
+            rad_a[valid] = c["c1"] * v + c["intercept"]
         rad_a[valid][rad_a[valid] <= 0] = np.nan
-        return radiance_to_bt(rad_a, wl_a)
+
+        # ③ 逆 Planck → 目标通道 BT 订正
+        bt_raw = radiance_to_bt(rad_a, wl_a)
+        return S_r * bt_raw + Q_r
     else:
-        # 非 IR 或无波长信息：直接对物理值应用系数
         out = np.full_like(val, np.nan, dtype=np.float32)
         v = val[valid]
-        if model_type == "linear":
-            out[valid] = c1 * v + intercept
+        if c["c2"] is not None:
+            out[valid] = c["c2"] * v ** 2 + c["c1"] * v + c["intercept"]
         else:
-            out[valid] = c2 * v ** 2 + c1 * v + intercept
+            out[valid] = c["c1"] * v + c["intercept"]
         return out
 
 
@@ -136,7 +166,7 @@ def convert_one_scene(fdi_path: Path, out_dir: Path, coeffs: dict) -> Optional[P
     """
     转换单个 FY-4B FDI 场景 → FY-4A 等效 BT .npz。
 
-    直接读取原始 DN + LUT 得到 BT，通过 Planck → radiance → 系数 → BT 完成转换。
+    通过 Planck 函数做 BT ↔ 辐亮度转换，在辐亮度空间应用 B2A 系数。
     """
     # 读原始场景获取 BT + 地理信息
     log.info("Reading: %s", fdi_path.name)
@@ -160,8 +190,8 @@ def convert_one_scene(fdi_path: Path, out_dir: Path, coeffs: dict) -> Optional[P
     bt_a = np.full_like(bt_b, np.nan, dtype=np.float32)
 
     for ci in range(C):
-        ch_b = b_indices[ci] + 1   # B 物理通道号
-        ch_a = a_indices[ci] + 1   # 对应 A 物理通道号
+        ch_b = b_indices[ci] + 1
+        ch_a = a_indices[ci] + 1
         wl_b = _WAVELENGTH_B.get(ch_b)
         wl_a = _WAVELENGTH_A.get(ch_a)
         log.info("  B%02d(%.2fμm) → A%02d(%.2fμm)", ch_b, wl_b or 0, ch_a, wl_a or 0)

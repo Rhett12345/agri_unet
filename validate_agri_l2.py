@@ -53,9 +53,21 @@ mpl.rcParams.update({
 OUT_DIR = cfg.ROOT / "eval" / "agri_l2_validation"
 
 
-def save_figure(fig, stem: str):
+def _classify_npz(npz_name: str) -> str:
+    """从文件名判别数据来源: 'fy4a' / 'fy4b_direct' / 'fy4b_b2a'。"""
+    if "FY4B" in npz_name or "FY4B" in npz_name:
+        if "converted" in npz_name.lower():
+            return "fy4b_b2a"
+        return "fy4b_direct"
+    return "fy4a"
+
+
+def save_figure(fig, stem: str, npz_name: str, day: str):
+    category = _classify_npz(npz_name)
+    fig_dir = OUT_DIR / category / day
+    fig_dir.mkdir(parents=True, exist_ok=True)
     for ext, dpi in [("svg", None), ("pdf", None), ("png", 300)]:
-        path = OUT_DIR / f"{stem}.{ext}"
+        path = fig_dir / f"{stem}.{ext}"
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
 
 
@@ -225,7 +237,8 @@ def _plot_cth_scatter(cth_pred: np.ndarray, cth_true: np.ndarray,
 
 
 def _plot_spatial_error(clp_pred: np.ndarray, clp_true: np.ndarray,
-                        lat: np.ndarray, lon: np.ndarray, scene_id: str):
+                        lat: np.ndarray, lon: np.ndarray, scene_id: str,
+                        sub_lon: float = 104.7):
     """Spatial map of CLP agreement / disagreement."""
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
@@ -234,7 +247,6 @@ def _plot_spatial_error(clp_pred: np.ndarray, clp_true: np.ndarray,
     agree = valid & (clp_pred == clp_true)
     disagree = valid & (clp_pred != clp_true)
 
-    sub_lon = 104.7
     data_crs = ccrs.PlateCarree()
     map_crs = ccrs.PlateCarree(central_longitude=sub_lon)
 
@@ -270,7 +282,10 @@ def _plot_spatial_error(clp_pred: np.ndarray, clp_true: np.ndarray,
 
 def validate_one(npz_path: Path, clp_nc: Path, cth_nc: Path,
                  out_dir: Path, scene_id: str = "") -> dict:
-    """Run validation for one triplet and save figures."""
+    """Run validation for one triplet and save figures。兼容 FY-4A / FY-4B。"""
+    npz_name = npz_path.name
+    day = scene_id[:8]
+
     # Read model predictions
     data = np.load(npz_path)
     clp_pred = data["CLP_pred"].astype(np.float32)
@@ -279,6 +294,10 @@ def validate_one(npz_path: Path, clp_nc: Path, cth_nc: Path,
     lon = data.get("longitude", np.zeros_like(clp_pred))
     data.close()
 
+    # 检测卫星确定星下点经度
+    sat = _detect_satellite(npz_name)
+    sub_lon = 133.0 if sat == "B" else 104.7
+
     # Read L2 truth
     clp_true = read_l2_clp(clp_nc)
     cth_true = read_l2_cth(cth_nc)
@@ -286,11 +305,9 @@ def validate_one(npz_path: Path, clp_nc: Path, cth_nc: Path,
     if clp_true is None or cth_true is None:
         raise RuntimeError(f"Failed to read L2 data for {scene_id}")
 
-    # Ensure same shape
     assert clp_pred.shape == clp_true.shape, (
         f"Shape mismatch: pred={clp_pred.shape} true={clp_true.shape}")
 
-    # Compute metrics
     metrics = compute_metrics(clp_pred, clp_true, cth_pred, cth_true)
     metrics["scene_id"] = scene_id
 
@@ -299,40 +316,70 @@ def validate_one(npz_path: Path, clp_nc: Path, cth_nc: Path,
 
     # Generate figures
     if out_dir:
-        out_dir.mkdir(parents=True, exist_ok=True)
         stem = scene_id.replace(" ", "_")
 
         cm = metrics.get("confusion_matrix")
         if cm is not None:
             fig_cm = _plot_confusion_matrix(cm, cfg.CLP_CLASS_NAMES, scene_id)
-            save_figure(fig_cm, f"{stem}_confusion")
+            save_figure(fig_cm, f"{stem}_confusion", npz_name, day)
             plt.close(fig_cm)
 
         if metrics["n_cth"] > 10:
             fig_scatter = _plot_cth_scatter(cth_pred, cth_true, metrics, scene_id)
-            save_figure(fig_scatter, f"{stem}_cth_scatter")
+            save_figure(fig_scatter, f"{stem}_cth_scatter", npz_name, day)
             plt.close(fig_scatter)
 
-        fig_spatial = _plot_spatial_error(clp_pred, clp_true, lat, lon, scene_id)
-        save_figure(fig_spatial, f"{stem}_spatial")
+        fig_spatial = _plot_spatial_error(clp_pred, clp_true, lat, lon, scene_id, sub_lon)
+        save_figure(fig_spatial, f"{stem}_spatial", npz_name, day)
         plt.close(fig_spatial)
 
     return metrics
 
 
+def _detect_satellite(filename: str) -> str:
+    """从文件名检测卫星: 'A' (FY-4A) 或 'B' (FY-4B)。"""
+    if "FY4B" in filename:
+        return "B"
+    return "A"
+
+
+def _find_l2_for_npz(npz_name: str, ts: str, product: str) -> Optional[Path]:
+    """根据 npz 文件名找到对应 L2 NC 文件。兼容 FY-4A / FY-4B。"""
+    sat = _detect_satellite(npz_name)
+    date_str = ts[:8]
+    if sat == "B":
+        l2_root = Path("/data/Data_yuq/FY4B")
+        disk_id = "1330E"
+        sat_id = "FY4B"
+    else:
+        l2_root = cfg.FY4A_L2_ROOT
+        disk_id = "1047E"
+        sat_id = "FY4A"
+
+    l2_dir = l2_root / product / date_str
+    if not l2_dir.is_dir():
+        return None
+
+    # 匹配逻辑：找同 timestamp 的 L2 文件
+    for f in sorted(l2_dir.iterdir()):
+        if not f.name.endswith(".NC"):
+            continue
+        f_ts = _extract_timestamp_from_filename(f.name)
+        if f_ts == ts:
+            return f
+    return None
+
+
 def find_npz_l2_pairs(npz_dir: Path, day: str) -> list:
-    """Pair model .npz files with L2 .NC files by timestamp."""
+    """Pair model .npz files with L2 .NC files by timestamp。兼容 FY-4A / FY-4B。"""
     npz_files = sorted(npz_dir.rglob(f"*{day}*.npz"))
     pairs = []
     for npz_path in npz_files:
         ts = _extract_timestamp_from_filename(npz_path.name)
         if ts is None:
             continue
-        # We need a dummy L1 FDI name for the matching helper
-        dummy_fdi_name = f"FY4A-_AGRI--_N_DISK_1047E_L1-_FDI-_MULT_NOM_{ts}_x_4000M_V0001.HDF"
-        dummy_path = Path(dummy_fdi_name)
-        clp_nc = _find_matching_l2_file(dummy_path, "CLP")
-        cth_nc = _find_matching_l2_file(dummy_path, "CTH")
+        clp_nc = _find_l2_for_npz(npz_path.name, ts, "CLP")
+        cth_nc = _find_l2_for_npz(npz_path.name, ts, "CTH")
         if clp_nc and cth_nc:
             scene_id = f"{ts[:8]}_{ts[8:]}"
             pairs.append((npz_path, clp_nc, cth_nc, scene_id))
