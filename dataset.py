@@ -1,27 +1,15 @@
 """
 dataset.py
 ==========
-PyTorch Dataset for the AGRI-only (no GIIRS) cloud-property retrieval task.
+PyTorch Dataset for AGRI → GPM precipitation classification.
 
 Key design decisions
 --------------------
-- **Lazy loading**: `__init__` only scans files and builds a patch index (list of
-  (file_path, i_start, j_start) tuples). Each `__getitem__` call opens the HDF5
-  file, reads only the required patch window via HDF5 hyperslab slicing, and
-  closes the file immediately. This keeps memory footprint minimal regardless of
-  dataset size, and makes dataset initialisation essentially instantaneous.
-
-- `NormStats` is pre-computed once and loaded from disk (see `compute_and_save_stats`).
-
-- `compute_and_save_stats` uses `concurrent.futures.ProcessPoolExecutor` to process
-  multiple files in parallel, then reduces partial sums on the main process.
-
-Label channel order
--------------------
-  0 : CLP  (float, integer class 0-4)
-  1 : CER  (µm,   z-score normalised in __getitem__)
-  2 : COT  (dimensionless, z-score normalised)
-  3 : CTH  (m,   z-score normalised)
+- **Lazy loading**: __init__ builds a patch index. Each __getitem__ opens the
+  HDF5 file, reads the required patch, and closes immediately. Memory is O(1)
+  regardless of dataset size.
+- **NormStats** is pre-computed once and loaded from disk.
+- Each sample: X=(7,11,11) AGRI patch, Y=scalar label 0-3
 """
 
 import logging
@@ -36,11 +24,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 import config as cfg
-from sample_filters import (
-    get_patch_supervision_thresholds,
-    patch_passes_supervision,
-    sample_passes_quality,
-)
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +42,8 @@ def _filter_h5_files_by_dates(h5_files: List[Path], mode: str) -> List[Path]:
     if not dates:
         return h5_files
     filtered = [p for p in h5_files if any(part in dates for part in p.parts)]
-    log.info("Using %d/%d %s files after date filter: %s",
-             len(filtered), len(h5_files), mode, ",".join(sorted(dates)))
+    log.info("Using %d/%d %s files after date filter",
+             len(filtered), len(h5_files), mode)
     return filtered
 
 
@@ -69,120 +52,51 @@ def _filter_h5_files_by_dates(h5_files: List[Path], mode: str) -> List[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NormStats:
-    """Container for per-channel mean/std + output percentiles."""
+    """Container for per-channel AGRI BT mean/std."""
 
-    def __init__(self,
-                 agri_mean: np.ndarray, agri_std: np.ndarray,
-                 out_mean:  np.ndarray, out_std:  np.ndarray,
-                 out_q5:    np.ndarray, out_q95:  np.ndarray):
+    def __init__(self, agri_mean: np.ndarray, agri_std: np.ndarray):
         self.agri_mean = agri_mean.astype(np.float32)
         self.agri_std  = agri_std.astype(np.float32)
-        self.out_mean  = out_mean.astype(np.float32)
-        self.out_std   = out_std.astype(np.float32)
-        self.out_q5    = out_q5.astype(np.float32)
-        self.out_q95   = out_q95.astype(np.float32)
 
     def save(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(path,
-                 agri_mean=self.agri_mean, agri_std=self.agri_std,
-                 out_mean=self.out_mean,   out_std=self.out_std,
-                 out_q5=self.out_q5,       out_q95=self.out_q95)
+        np.savez(path, agri_mean=self.agri_mean, agri_std=self.agri_std)
         log.info("Saved normalisation stats → %s", path)
 
     @classmethod
     def load(cls, path: Path) -> "NormStats":
         d = np.load(path)
-        return cls(d["agri_mean"], d["agri_std"],
-                   d["out_mean"],  d["out_std"],
-                   d["out_q5"],    d["out_q95"])
+        return cls(d["agri_mean"], d["agri_std"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stats: per-file worker (runs in subprocess)
+# Stats: per-file worker
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _stats_worker(h5_path: str) -> Optional[dict]:
-    import h5py, numpy as np
-
-    MAX_SAMPLE = 4096
-
+    import h5py
+    import numpy as np
     try:
         with h5py.File(h5_path, "r") as f:
-            n_out_channels = 2  # CLP + CTH
-
-            if "Samples" in f and "agri" in f["Samples"] and "labels" in f["Samples"]:
-                # 新格式: Samples/agri -> (N, C, H, W), Samples/labels -> (N, 2, H, W)
-                BT = f["Samples/agri"][()].astype(np.float64)
-                lbl = f["Samples/labels"][()].astype(np.float64)
-
-                n_agri = BT.shape[1]
-                if n_agri != cfg.AGRI_CHANNELS:
-                    log.warning("Skip %s: BT channels=%d, expected=%d", h5_path, n_agri, cfg.AGRI_CHANNELS)
-                    return None
-                flat_bt = BT.transpose(0, 2, 3, 1).reshape(-1, n_agri)
-                flat_out = lbl.transpose(0, 2, 3, 1).reshape(-1, n_out_channels)
-
-            else:
-                # 旧格式: AGRI/BT + Labels/*
-                bt_keys = sorted(f["AGRI/BT"].keys())
-                n_agri = len(bt_keys)
-                if n_agri != cfg.AGRI_CHANNELS:
-                    log.warning("Skip %s: BT channels=%d, expected=%d", h5_path, n_agri, cfg.AGRI_CHANNELS)
-                    return None
-
-                BT = np.stack(
-                    [f[f"AGRI/BT/{k}"][()].astype(np.float64) for k in bt_keys],
-                    axis=-1,   # (H, W, C)
-                )
-
-                CLP = f["Labels/CLP"][()].astype(np.float64)
-                CTH = f["Labels/CTH"][()].astype(np.float64)
-
-                out = np.stack([CLP, CTH], axis=-1)  # (H, W, 2)
-                flat_bt = BT.reshape(-1, n_agri)
-                flat_out = out.reshape(-1, n_out_channels)
-
-    except Exception as exc:
-        log.warning("Stats worker failed for %s: %s", h5_path, exc)
+            if "Samples" not in f or "agri" not in f["Samples"]:
+                return None
+            bt = f["Samples/agri"][()].astype(np.float64)  # (N, C, H, W)
+            n_agri = bt.shape[1]
+            if n_agri != cfg.AGRI_CHANNELS:
+                return None
+            flat_bt = bt.transpose(0, 2, 3, 1).reshape(-1, n_agri)
+    except Exception:
         return None
 
-    valid_bt = np.isfinite(flat_bt).all(axis=1)
-    valid_out = np.isfinite(flat_out)
-    n_bt = int(valid_bt.sum())
-    n_out = valid_out.sum(axis=0).astype(np.int64)
-
-    if n_bt == 0 or np.any(n_out == 0):
+    valid = np.isfinite(flat_bt).all(axis=1) & (flat_bt != 0.0).any(axis=1)
+    n_bt = int(valid.sum())
+    if n_bt == 0:
         return None
-
-    bt_valid = flat_bt[valid_bt]
-    sum_bt = bt_valid.sum(axis=0)
-    sumsq_bt = (bt_valid ** 2).sum(axis=0)
-
-    sum_out = np.zeros(2, dtype=np.float64)
-    sumsq_out = np.zeros(2, dtype=np.float64)
-    for ch in range(2):
-        vals = flat_out[valid_out[:, ch], ch]
-        sum_out[ch] = vals.sum()
-        sumsq_out[ch] = (vals ** 2).sum()
-
-    # CTH regression sample (channel 1 only)
-    vals = flat_out[valid_out[:, 1], 1]
-    if vals.size > MAX_SAMPLE:
-        idx = np.random.choice(vals.size, MAX_SAMPLE, replace=False)
-        vals = vals[idx]
-    reg = vals.reshape(-1, 1)  # (n, 1)
-
+    bt_valid = flat_bt[valid]
     return {
         "n": n_bt,
-        "n_bt": n_bt,
-        "n_out": n_out,
-        "sum_bt": sum_bt,
-        "sumsq_bt": sumsq_bt,
-        "sum_out": sum_out,
-        "sumsq_out": sumsq_out,
-        "reg_sample": reg,
-        "path": h5_path,
+        "sum_bt": bt_valid.sum(axis=0),
+        "sumsq_bt": (bt_valid ** 2).sum(axis=0),
     }
 
 
@@ -191,218 +105,63 @@ def compute_and_save_stats(
     out_path: Path = cfg.STATS_FILE,
     n_workers: int = min(8, os.cpu_count() or 1),
 ) -> "NormStats":
-    """
-    Compute normalisation statistics from all paired HDF5 files under `paired_dir`.
-
-    Optimisations vs. original:
-    1. Parallel file reading via ProcessPoolExecutor (n_workers subprocesses).
-       Each worker returns partial accumulators; the main process reduces them.
-       This typically gives a 4-8× speedup on multi-core machines.
-    2. Only valid (fully-finite) pixels contribute to mean/std.
-    3. Reservoir for percentile estimation is capped at 500 000 pixels total.
-    """
-    log.info("Computing normalisation statistics from %s  (workers=%d)", paired_dir, n_workers)
+    """Compute normalisation statistics from all paired HDF5 files."""
+    log.info("Computing normalisation statistics from %s (workers=%d)", paired_dir, n_workers)
 
     h5_files = _filter_h5_files_by_dates(sorted(paired_dir.rglob("*.h5")), "train")
     if not h5_files:
         raise FileNotFoundError(f"No .h5 files found under {paired_dir}")
 
     n_agri = cfg.AGRI_CHANNELS
-    n_out = 2  # CLP + CTH
-
-    total_n_bt = 0
-    total_n_out = np.zeros(n_out, dtype=np.int64)
-    sum_bt    = np.zeros(n_agri, dtype=np.float64)
-    sumsq_bt  = np.zeros(n_agri, dtype=np.float64)
-    sum_out   = np.zeros(n_out, dtype=np.float64)
-    sumsq_out = np.zeros(n_out, dtype=np.float64)
-
-    MAX_RESERVOIR = 500_000
-    reservoir: List[np.ndarray] = []
-    reservoir_n = 0
+    total_n = 0
+    sum_bt   = np.zeros(n_agri, dtype=np.float64)
+    sumsq_bt = np.zeros(n_agri, dtype=np.float64)
 
     paths = [str(p) for p in h5_files]
-
+    done = 0
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_stats_worker, p): p for p in paths}
-        done = 0
         for fut in as_completed(futures):
             done += 1
-            p = futures[fut]
             result = fut.result()
             if result is None:
-                log.warning("Skip %s (worker returned None)", p)
                 continue
-
-            n_bt = result.get("n_bt", result["n"])
-            n_out_ch = result.get("n_out", np.full(n_out, result["n"], dtype=np.int64))
-            total_n_bt += n_bt
-            total_n_out += n_out_ch
-            sum_bt    += result["sum_bt"]
-            sumsq_bt  += result["sumsq_bt"]
-            sum_out   += result["sum_out"]
-            sumsq_out += result["sumsq_out"]
-
-            reg = result["reg_sample"]
-            reservoir.append(reg)
-            reservoir_n += reg.shape[0]
-
-            # Trim reservoir to avoid unbounded growth
-            if reservoir_n > MAX_RESERVOIR:
-                tmp = np.concatenate(reservoir, axis=0)
-                idx = np.random.choice(tmp.shape[0], MAX_RESERVOIR, replace=False)
-                reservoir  = [tmp[idx]]
-                reservoir_n = MAX_RESERVOIR
-
+            total_n += result["n"]
+            sum_bt   += result["sum_bt"]
+            sumsq_bt += result["sumsq_bt"]
             if done % 10 == 0 or done == len(paths):
-                log.info("  %d / %d files processed  (valid BT px so far: %d)",
-                         done, len(paths), total_n_bt)
+                log.info("  %d / %d files processed", done, len(paths))
 
-    if total_n_bt < 2 or np.any(total_n_out < 2):
-        raise RuntimeError(
-            "Not enough valid pixels to compute statistics "
-            f"(BT={total_n_bt}, outputs={total_n_out.tolist()})."
-        )
+    if total_n < 2:
+        raise RuntimeError(f"Not enough valid pixels: {total_n}")
 
-    agri_mean = (sum_bt  / total_n_bt).astype(np.float32)
-    out_mean  = (sum_out / total_n_out).astype(np.float32)
+    agri_mean = (sum_bt / total_n).astype(np.float32)
+    agri_var  = (sumsq_bt - (sum_bt ** 2) / total_n) / (total_n - 1)
+    agri_std  = np.sqrt(np.maximum(agri_var, 1e-12)).astype(np.float32)
 
-    agri_var = (sumsq_bt  - (sum_bt  ** 2) / total_n_bt) / (total_n_bt - 1)
-    out_var  = (sumsq_out - (sum_out ** 2) / total_n_out) / (total_n_out - 1)
-
-    agri_std = np.sqrt(np.maximum(agri_var, 1e-12)).astype(np.float32)
-    out_std  = np.sqrt(np.maximum(out_var,  1e-12)).astype(np.float32)
-
-    all_reg = np.concatenate(reservoir, axis=0)   # (N_total, 1): CTH only
-    q5  = np.concatenate([[0.0], np.nanpercentile(all_reg,  5, axis=0)])
-    q95 = np.concatenate([[float(cfg.CLP_CLASSES - 1)], np.nanpercentile(all_reg, 95, axis=0)])
-
-    stats = NormStats(
-        agri_mean=agri_mean, agri_std=agri_std,
-        out_mean=out_mean,   out_std=out_std,
-        out_q5=q5.astype(np.float32), out_q95=q95.astype(np.float32),
-    )
+    stats = NormStats(agri_mean=agri_mean, agri_std=agri_std)
     stats.save(out_path)
-    log.info(
-        "Stats computed across %d files (BT valid px=%d, output valid px=%s)",
-        len(h5_files), total_n_bt, total_n_out.tolist()
-    )
+    log.info("Stats computed across %d files (valid px=%d)", len(h5_files), total_n)
     return stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch index builder (runs once in __init__)
+# Patch index builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_patch_index(
-    h5_files: List[Path],
-    patch_size: Tuple[int, int],
-    mode: str,
-) -> List[Tuple[Path, int, int]]:
-    """
-    Scan all HDF5 files and return a list of (file_path, i_start, j_start)
-    tuples that will form the dataset.
-
-    Patch filtering is shared with data_fusion.py via sample_filters.py so that
-    train / val / test all follow the same supervision thresholds and no stale
-    hard-coded `16 pixels` rule remains in the runtime dataset path.
-    """
-    ph, pw = patch_size
-    index: List[Tuple[Path, int, int]] = []
-
-    sh, sw = ph, pw  # non-overlapping for all modes
-
-    thresholds = get_patch_supervision_thresholds(mode, patch_size)
-
-    def _sample_values(samples, names, idx):
-        for name in names:
-            if name in samples:
-                return samples[name][idx]
-        return np.nan
-
-    def _sample_quality_fields(samples, idx):
-        return {
-            "mean_overlap_frac": _sample_values(samples, ["mean_overlap_frac"], idx),
-            "max_time_diff_min": _sample_values(samples, ["max_time_diff_min"], idx),
-            "mean_phase_consist": _sample_values(samples, ["mean_phase_consist"], idx),
-            "mean_cloud_frac": _sample_values(samples, ["mean_cloud_frac"], idx),
-            "valid_cloudy_pixels": _sample_values(
-                samples,
-                ["valid_cloudy_pixels", "valid_cloudy_px"],
-                idx,
-            ),
-        }
-
+def _build_patch_index(h5_files: List[Path], mode: str) -> List[Tuple[Path, int]]:
+    """Scan all HDF5 files and return list of (file_path, sample_idx) tuples."""
+    index: List[Tuple[Path, int]] = []
     for h5f in h5_files:
         try:
             with h5py.File(h5f, "r") as f:
-                if "Samples" in f and "agri" in f["Samples"] and "labels" in f["Samples"]:
-                    samples = f["Samples"]
-                    # Validate compressed data is readable before indexing
-                    try:
-                        _ = samples["agri"][0]
-                    except Exception:
-                        log.warning("Skip %s: corrupted HDF5 data (filter read failure)", h5f.name)
-                        continue
-                    n_samples = int(samples["agri"].shape[0])
-
-                    has_cached_counts = (
-                        "valid_clp_px" in samples and "valid_cloudy_px" in samples
-                    )
-                    if has_cached_counts:
-                        valid_label_pixels = samples["valid_clp_px"][()]
-                        valid_cloudy_pixels = samples["valid_cloudy_px"][()]
-                        for s in range(n_samples):
-                            if (
-                                int(valid_label_pixels[s]) >= thresholds["min_valid_label_pixels"]
-                                and int(valid_cloudy_pixels[s]) >= thresholds["min_valid_cloudy_pixels"]
-                                and sample_passes_quality(_sample_quality_fields(samples, s))
-                            ):
-                                index.append((h5f, s, -1))
-                    else:
-                        for s in range(n_samples):
-                            patch_clp, patch_cth = samples["labels"][s]
-                            keep, _counts, _ = patch_passes_supervision(
-                                patch_clp,
-                                np.full_like(patch_clp, np.nan),
-                                np.full_like(patch_clp, np.nan),
-                                patch_cth, mode, patch_size
-                            )
-                            if keep and sample_passes_quality(_sample_quality_fields(samples, s)):
-                                index.append((h5f, s, -1))
+                if "Samples" not in f or "agri" not in f["Samples"]:
                     continue
-
-                CLP = f["Labels/CLP"][()]
-                CTH = f["Labels/CTH"][()]
-                H, W = CLP.shape
-                _nan2d = np.full_like(CLP, np.nan, dtype=np.float32)
-
-                h_positions = list(range(0, H - ph + 1, sh))
-                if h_positions and h_positions[-1] != H - ph:
-                    h_positions.append(H - ph)
-
-                w_positions = list(range(0, W - pw + 1, sw))
-                if w_positions and w_positions[-1] != W - pw:
-                    w_positions.append(W - pw)
-
-                for i in h_positions:
-                    for j in w_positions:
-                        patch_clp = CLP[i:i + ph, j:j + pw]
-                        patch_cth = CTH[i:i + ph, j:j + pw]
-
-                        keep, _counts, _ = patch_passes_supervision(
-                            patch_clp,
-                            _nan2d[i:i+ph, j:j+pw],
-                            _nan2d[i:i+ph, j:j+pw],
-                            patch_cth, mode, patch_size
-                        )
-                        if keep:
-                            index.append((h5f, i, j))
-
-        except Exception as exc:
-            log.warning("Skip %s during index build: %s", h5f, exc)
+                n = int(f["Samples/agri"].shape[0])
+                for s in range(n):
+                    index.append((h5f, s))
+        except Exception:
             continue
-
     return index
 
 
@@ -410,23 +169,14 @@ def _build_patch_index(
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
-class AGRIMyd06Dataset(Dataset):
+class PrecipDataset(Dataset):
     """
-    PyTorch Dataset for AGRI → (CLP, CER, COT, CTH) retrieval.
+    PyTorch Dataset for AGRI → GPM precipitation classification.
 
-    **Lazy-loading design**: only a lightweight patch index (file path + pixel
-    offsets) is built at construction time.  The actual HDF5 read happens inside
-    `__getitem__` using HDF5 hyperslab slicing, so memory usage is O(1) in the
-    number of files rather than O(N_files × scene_size).
-
-    Each item is a tuple:
-        agri   : FloatTensor  (8, patch_H, patch_W) – z-score normalised BT
-        geo    : FloatTensor  (4, patch_H, patch_W) – [lat/90, lon/180, VZA/90, SZA/90]
-        labels : FloatTensor  (4, patch_H, patch_W)
-                   ch0 = CLP (float, integer class 0-2)
-                   ch1 = CER (µm,  z-score normalised, NaN for clear/missing)
-                   ch2 = COT (z-score normalised, NaN for clear/missing)
-                   ch3 = CTH (m,   z-score normalised, NaN for clear/missing)
+    Each item:
+        agri  : FloatTensor (7, 11, 11) – z-score normalised BT
+        geo   : FloatTensor (4, 11, 11) – [lat/90, lon/180, VZA/90, SZA/90]
+        label : LongTensor (11, 11) – integer class label 0-3
     """
 
     def __init__(self,
@@ -443,158 +193,84 @@ class AGRIMyd06Dataset(Dataset):
         if not h5_files:
             raise FileNotFoundError(f"No .h5 files found in {paired_dir}")
 
-        thresholds = get_patch_supervision_thresholds(mode, patch_size)
-        log.info(
-            "Building patch index from %d files in %s (mode=%s, min_valid_label=%d, min_valid_cloudy=%d) …",
-            len(h5_files),
-            paired_dir,
-            mode,
-            thresholds["min_valid_label_pixels"],
-            thresholds["min_valid_cloudy_pixels"],
-        )
-
-        # Build lightweight index – does NOT load pixel data into RAM
-        self._index = _build_patch_index(h5_files, patch_size, mode)
-
-        log.info("Dataset ready – %d patches (from %d files, mode=%s)",
+        log.info("Building patch index from %d files (mode=%s)...", len(h5_files), mode)
+        self._index = _build_patch_index(h5_files, mode)
+        log.info("Dataset ready – %d samples (from %d files, mode=%s)",
                  len(self._index), len(h5_files), mode)
+
+        self._warned_files = set()
 
     def __len__(self) -> int:
         return len(self._index)
 
     def __getitem__(self, idx: int):
-        h5f, i, j = self._index[idx]
+        h5f, s_idx = self._index[idx]
         ph, pw = self.ph, self.pw
 
-        # ── Read only the required patch via HDF5 hyperslab ───────────────
         for attempt in range(10):
             try:
                 with h5py.File(h5f, "r") as f:
-                    if j < 0 and "Samples" in f and "agri" in f["Samples"]:
-                        agri_patch = f["Samples/agri"][i].astype(np.float32)  # (C, H, W)
-                        geo_patch  = f["Samples/geo"][i].astype(np.float32)   # (4, H, W): lat,lon,VZA,SZA
-                        label_patch = f["Samples/labels"][i].astype(np.float32)  # (4, H, W)
+                    samples = f["Samples"]
+                    agri_patch = samples["agri"][s_idx].astype(np.float32)   # (7, H, W)
+                    geo_patch  = samples["geo"][s_idx].astype(np.float32)    # (4, H, W)
+                    label_val  = int(samples["label"][s_idx])                 # scalar
 
-                        BT = agri_patch.transpose(1, 2, 0)
-                        geo = geo_patch   # (4, H, W)
-                        CLP, CTH = label_patch
-                    else:
-                        bt_keys = sorted(f["AGRI/BT"].keys())
-                        bt_patches = [
-                            f[f"AGRI/BT/{k}"][i:i + ph, j:j + pw].astype(np.float32)
-                            for k in bt_keys
-                        ]
-                        BT = np.stack(bt_patches, axis=-1)
-
-                        lat = f["AGRI/Geolocation/lat"][i:i + ph, j:j + pw].astype(np.float32)
-                        lon = f["AGRI/Geolocation/lon"][i:i + ph, j:j + pw].astype(np.float32)
-                        vza = np.zeros_like(lat)
-                        sza = np.zeros_like(lat)
-                        geo = np.stack([lat, lon, vza, sza], axis=0)  # (4, H, W)
-
-                        CLP = f["Labels/CLP"][i:i + ph, j:j + pw].astype(np.float32)
-                        CTH = f["Labels/CTH"][i:i + ph, j:j + pw].astype(np.float32)
-                break  # read succeeded
-
-            except Exception as exc:
-                if attempt == 0:
-                    if not hasattr(self, "_warned_files"):
-                        self._warned_files = set()
-                    if h5f.name not in self._warned_files:
-                        log.warning("Read error at %s [%d,%d]: %s", h5f.name, i, j, exc)
-                        self._warned_files.add(h5f)
+                break
+            except Exception:
+                if attempt == 0 and h5f.name not in self._warned_files:
+                    log.warning("Read error at %s [%d]", h5f.name, s_idx)
+                    self._warned_files.add(h5f)
                 if attempt == 9:
                     log.error("All read retries exhausted, returning zero sample")
-                    C = len(cfg.AGRI_BT_CHANNEL_INDICES)
-                    agri_t = torch.zeros(C, ph, pw, dtype=torch.float32)
-                    geo_t = torch.zeros(4, ph, pw, dtype=torch.float32)
-                    lbl_t = torch.full((2, ph, pw), float("nan"), dtype=torch.float32)
-                    return agri_t, geo_t, lbl_t
-                h5f, i, j = self._index[np.random.randint(0, len(self._index))]
+                    return (
+                        torch.zeros(cfg.AGRI_CHANNELS, ph, pw),
+                        torch.zeros(cfg.GEO_CHANNELS, ph, pw),
+                        torch.full((ph, pw), -100, dtype=torch.long),
+                    )
+                h5f, s_idx = self._index[np.random.randint(0, len(self._index))]
 
-        # ── CLP label remap/QC (supports old 5-class H5 files) ───────────
-        remap = getattr(cfg, "CLP_LABEL_REMAP", None)
-        if remap:
-            remapped_clp = np.full_like(CLP, np.nan, dtype=np.float32)
-            for old_label, new_label in remap.items():
-                remapped_clp[CLP == old_label] = new_label
-            CLP = remapped_clp
-
-        # ── Label QC (per-channel NaN masking) ──────────────────────────
-        bad_clp = (CLP < 0) | (CLP >= cfg.CLP_CLASSES)
-        max_cth = getattr(cfg, "MAX_CTH_M", 18000)
-        bad_cth = (CTH < 0) | (CTH > max_cth)
-
-        CLP[bad_clp] = np.nan
-        CTH[bad_cth] = np.nan
-
-        # ── Normalise BT (z-score) ────────────────────────────────────────
-        agri_norm = (BT - self.stats.agri_mean) / (self.stats.agri_std + 1e-8)
+        # ── BT normalisation ──
+        agri_norm = (agri_patch - self.stats.agri_mean[:, None, None]) / \
+                     (self.stats.agri_std[:, None, None] + 1e-8)
         agri_norm = np.nan_to_num(agri_norm, nan=0.0)
 
-        # ── Normalise geo: lat/90, lon/180, VZA/90, SZA/90 → roughly [-1,1] ─
-        # geo is (4, H, W): [lat, lon, VZA, SZA]
-        geo_norm = geo.copy()
-        geo_norm[0] = geo[0] / 90.0
-        geo_norm[1] = geo[1] / 180.0
-        geo_norm[2] = geo[2] / 90.0
-        geo_norm[3] = geo[3] / 90.0
-        geo_norm = np.nan_to_num(geo_norm, nan=0.0)  # (4, H, W)
-        geo_norm = geo_norm.transpose(1, 2, 0)        # (H, W, 4)
+        # ── Geo normalisation ──
+        geo_norm = geo_patch.copy()
+        geo_norm[0] = geo_patch[0] / 90.0
+        geo_norm[1] = geo_patch[1] / 180.0
+        geo_norm[2] = geo_patch[2] / 90.0
+        geo_norm[3] = geo_patch[3] / 90.0
+        geo_norm = np.nan_to_num(geo_norm, nan=0.0)
 
-        # ── Normalise regression labels; keep CLP raw; keep NaN in labels ─
-        lbl = np.stack([CLP, CTH], axis=-1)   # (ph, pw, 2)
-        lbl[..., 1:] = (lbl[..., 1:] - self.stats.out_mean[1:]) / (self.stats.out_std[1:] + 1e-8)
+        # ── Label: broadcast scalar to full patch ──
+        label = np.full((ph, pw), label_val, dtype=np.int64)
 
-        # ── Train augmentations ───────────────────────────────────────────
+        # ── Train augmentations ──
         if self.mode == "train":
             # Gaussian noise on BTs
             agri_norm = agri_norm + np.random.randn(*agri_norm.shape).astype(np.float32) * 0.02
 
-            # Random horizontal / vertical flip (agri + labels only; geo coords stay fixed)
+            # Random horizontal / vertical flip
+            if np.random.rand() < 0.5:
+                agri_norm = np.flip(agri_norm, axis=2).copy()
+                geo_norm  = np.flip(geo_norm,  axis=2).copy()
+                label     = np.flip(label,     axis=1).copy()
             if np.random.rand() < 0.5:
                 agri_norm = np.flip(agri_norm, axis=1).copy()
-                lbl       = np.flip(lbl,       axis=1).copy()
-            if np.random.rand() < 0.5:
-                agri_norm = np.flip(agri_norm, axis=0).copy()
-                lbl       = np.flip(lbl,       axis=0).copy()
+                geo_norm  = np.flip(geo_norm,  axis=1).copy()
+                label     = np.flip(label,     axis=0).copy()
 
-            # Random 90° rotation (agri + labels only; geo coords stay fixed)
+            # Random 90° rotation
             k = np.random.randint(0, 4)
             if k:
-                agri_norm = np.rot90(agri_norm, k=k, axes=(0, 1)).copy()
-                lbl       = np.rot90(lbl,       k=k, axes=(0, 1)).copy()
+                agri_norm = np.rot90(agri_norm, k=k, axes=(1, 2)).copy()
+                geo_norm  = np.rot90(geo_norm,  k=k, axes=(1, 2)).copy()
+                label     = np.rot90(label,     k=k, axes=(0, 1)).copy()
 
-            # Random scale (90% – 110%) + pad/crop back to 32×32
-            if np.random.rand() < 0.5:
-                scale = np.random.uniform(0.9, 1.1)
-                new_h = max(16, int(ph * scale))
-                new_w = max(16, int(pw * scale))
-                # Crop centre region then pad back
-                h0 = max(0, (ph - new_h) // 2)
-                w0 = max(0, (pw - new_w) // 2)
-                agri_crop = agri_norm[h0:h0+new_h, w0:w0+new_w, :]
-                lbl_crop  = lbl[h0:h0+new_h, w0:w0+new_w, :]
-                # Pad back to original size
-                pad_h = ph - agri_crop.shape[0]
-                pad_w = pw - agri_crop.shape[1]
-                if pad_h > 0 or pad_w > 0:
-                    agri_crop = np.pad(agri_crop, ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
-                                       mode="reflect")
-                    lbl_crop  = np.pad(lbl_crop,  ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
-                                       mode="constant", constant_values=np.nan)
-                agri_norm = agri_crop[:ph, :pw, :]
-                lbl       = lbl_crop[:ph, :pw, :]
-
-            # Random BT brightness jitter (global shift per channel, simulates calibration bias)
-            if np.random.rand() < 0.3:
-                jitter = np.random.randn(agri_norm.shape[-1]).astype(np.float32) * 0.05
-                agri_norm = agri_norm + jitter
-
-        # ── (H, W, C) → (C, H, W) for PyTorch ───────────────────────────
-        agri_t = torch.from_numpy(agri_norm.transpose(2, 0, 1))
-        geo_t  = torch.from_numpy(geo_norm.transpose(2, 0, 1))
-        lbl_t  = torch.from_numpy(lbl.transpose(2, 0, 1))
+        # ── Convert to torch ──
+        agri_t = torch.from_numpy(agri_norm.copy())
+        geo_t  = torch.from_numpy(geo_norm.copy())
+        lbl_t  = torch.from_numpy(label.copy())
 
         return agri_t, geo_t, lbl_t
 
@@ -604,23 +280,21 @@ class AGRIMyd06Dataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_dataloaders(stats: NormStats):
-    """Return train / val / test DataLoaders using config paths."""
-    train_ds = AGRIMyd06Dataset(cfg.PAIRED_TRAIN_DIR, stats, mode="train")
-    val_ds   = AGRIMyd06Dataset(cfg.PAIRED_VAL_DIR,   stats, mode="val")
-    test_ds  = AGRIMyd06Dataset(cfg.PAIRED_TEST_DIR,  stats, mode="test")
+    """Return train / val / test DataLoaders."""
+    train_ds = PrecipDataset(cfg.PAIRED_TRAIN_DIR, stats, mode="train")
+    val_ds   = PrecipDataset(cfg.PAIRED_VAL_DIR,   stats, mode="val")
+    test_ds  = PrecipDataset(cfg.PAIRED_TEST_DIR,  stats, mode="test")
 
     common   = dict(pin_memory=True, num_workers=cfg.NUM_WORKERS)
     train_dl = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,  **common)
     val_dl   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False, **common)
-    test_dl  = DataLoader(test_ds,  batch_size=1,              shuffle=False, **common)
+    test_dl  = DataLoader(test_ds,  batch_size=cfg.BATCH_SIZE, shuffle=False, **common)
 
     return train_dl, val_dl, test_dl
 
 
 def build_test_dataloader(stats: NormStats):
-    """Return only the test DataLoader using config paths."""
-    log.info("Loading test split only from %s (mode=test)", cfg.PAIRED_TEST_DIR)
-    test_ds = AGRIMyd06Dataset(cfg.PAIRED_TEST_DIR, stats, mode="test")
-
-    common = dict(pin_memory=True, num_workers=cfg.NUM_WORKERS)
-    return DataLoader(test_ds, batch_size=1, shuffle=False, **common)
+    """Return only the test DataLoader."""
+    test_ds = PrecipDataset(cfg.PAIRED_TEST_DIR, stats, mode="test")
+    return DataLoader(test_ds, batch_size=cfg.BATCH_SIZE, shuffle=False,
+                      pin_memory=True, num_workers=cfg.NUM_WORKERS)

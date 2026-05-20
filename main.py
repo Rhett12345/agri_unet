@@ -1,20 +1,20 @@
 """
-main.py  (适配质量优先多进程融合版)
+main.py
 ========
-Pipeline orchestrator - single entry point for all stages.
+Pipeline orchestrator for AGRI → GPM precipitation classification.
 
 Stages
 ------
-  fuse      -> data_fusion.py  : 质量优先多进程融合 AGRI + MYD06
+  fuse      -> data_fusion.py  : GPM+AGRI data pairing
   stats     -> dataset.py      : compute normalisation statistics
   train     -> train.py        : train the model
   test      -> test.py         : evaluate on held-out test set
-  infer     -> inference.py    : full-disk retrieval for new AGRI files
+  infer     -> inference.py    : full-disk inference for new AGRI files
 
 Usage examples
 --------------
   python main.py --stages fuse stats train test
-  python main.py --stages fuse --split train --day 20190105 --workers 8
+  python main.py --stages fuse --split train --day 20190101 --workers 8
   python main.py --stages train
   python main.py --stages infer --agri_file /path/to/FY4A_AGRI_*.HDF
 """
@@ -46,10 +46,8 @@ def _setup_logging():
 # ---------------------------------------------------------------------------
 
 def stage_fuse(args):
-    """调用 L1B+L2 配对引擎。"""
-    import fusion_config as fc
-    from data_fusion import _find_day_folders, fuse_day
-    from data_fusion import _reset_qc_diagnostics
+    """GPM+AGRI 数据配对。"""
+    from data_fusion import find_day_folders, fuse_day
 
     split_out = {
         "train": cfg.PAIRED_TRAIN_DIR,
@@ -64,16 +62,10 @@ def stage_fuse(args):
 
     split = getattr(args, "split", "train")
     dates = [args.day] if getattr(args, "day", None) else split_dates[split]
-    n_workers = getattr(args, "workers", fc.N_FUSION_WORKERS)
-    qc_diag_enabled = bool(
-        getattr(args, "enable_qc_diagnostics", False)
-        or getattr(fc, "ENABLE_QC_DIAGNOSTICS", False)
-    )
-    qc_diag_dir = Path(getattr(args, "qc_diagnostics_dir", None) or fc.QC_DIAGNOSTICS_DIR)
-    if qc_diag_enabled:
-        _reset_qc_diagnostics(qc_diag_dir)
+    n_workers = getattr(args, "workers", 1)
+    max_dt_min = getattr(args, "max_dt_min", None)
 
-    agri_days = _find_day_folders(cfg.AGRI_ROOT, dates)
+    agri_days = find_day_folders(cfg.AGRI_ROOT, dates)
 
     for agri_day in agri_days:
         out_sub = split_out[split] / agri_day.name
@@ -83,8 +75,7 @@ def stage_fuse(args):
             mode=split,
             overwrite=getattr(args, "overwrite", False),
             n_workers=n_workers,
-            enable_qc_diagnostics=qc_diag_enabled,
-            qc_diagnostics_dir=qc_diag_dir,
+            max_dt_min=max_dt_min,
         )
 
 
@@ -114,7 +105,7 @@ def stage_test(args):
         log.error("Stats file not found: %s", cfg.STATS_FILE)
         sys.exit(1)
     stats = NormStats.load(cfg.STATS_FILE)
-    ckpt  = Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
+    ckpt = Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
     evaluate(stats, ckpt)
 
 
@@ -125,7 +116,7 @@ def stage_infer(args):
         log.error("Stats file not found: %s", cfg.STATS_FILE)
         sys.exit(1)
     stats = NormStats.load(cfg.STATS_FILE)
-    ckpt  = Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
+    ckpt = Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
     out_d = Path(args.out_dir) if getattr(args, "out_dir", None) else cfg.RETRIEVAL_DIR
 
     if getattr(args, "agri_file", None):
@@ -156,21 +147,15 @@ STAGE_FN = {
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="AGRI + MYD06 cloud retrieval pipeline (质量优先多进程版)",
+        description="AGRI → GPM precipitation classification pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
     p.add_argument("--stages",     nargs="+", choices=list(STAGE_FN.keys()), required=True)
-    p.add_argument("--split",      default="train", choices=["train","val","test"])
+    p.add_argument("--split",      default="train", choices=["train", "val", "test"])
     p.add_argument("--day",        default=None)
     p.add_argument("--overwrite",  action="store_true")
-    p.add_argument("--max_qc",     type=int, default=3)
-    p.add_argument("--workers",    type=int, default=None,
-                   help="融合并行进程数（默认 CPU-1）")
-    p.add_argument("--enable-qc-diagnostics", action="store_true",
-                   help="输出每个 scene 的融合 QC gate 诊断 CSV/JSONL")
-    p.add_argument("--qc-diagnostics-dir", default=None,
-                   help="QC gate 诊断输出目录")
+    p.add_argument("--workers",    type=int, default=None)
+    p.add_argument("--max-dt-min", type=float, default=None)
     p.add_argument("--checkpoint", default=None)
     p.add_argument("--agri_file",  default=None)
     p.add_argument("--agri_dir",   default=None)
@@ -182,7 +167,6 @@ def main():
     _setup_logging()
     args = parse_args()
 
-    # 若未指定 workers，从 fusion_config 读取默认值
     if args.workers is None:
         try:
             import fusion_config as fc
