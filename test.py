@@ -185,18 +185,17 @@ def collect_test_predictions(
     all_pred = []
 
     with torch.no_grad():
-        for agri, geo, labels in test_dl:
-            agri   = agri.to(device)
-            geo    = geo.to(device)
+        for x, labels in test_dl:
+            x = x.to(device)
             labels = labels.to(device)
 
-            logits = model(agri, geo=geo)
-            preds = logits.argmax(dim=1)  # (B, H, W)
+            logits = model(x)              # (B, 4)
+            preds = logits.argmax(dim=1)   # (B,)
 
             valid = (labels >= 0) & (labels < cfg.NUM_CLASSES)
             if valid.any():
-                all_true.append(labels[valid].cpu().numpy().ravel())
-                all_pred.append(preds[valid].cpu().numpy().ravel())
+                all_true.append(labels[valid].cpu().numpy())
+                all_pred.append(preds[valid].cpu().numpy())
 
     return {
         "y_true": np.concatenate(all_true) if all_true else np.array([], dtype=np.int64),

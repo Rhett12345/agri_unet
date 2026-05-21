@@ -174,9 +174,9 @@ class PrecipDataset(Dataset):
     PyTorch Dataset for AGRI → GPM precipitation classification.
 
     Each item:
-        agri  : FloatTensor (7, 11, 11) – z-score normalised BT
-        geo   : FloatTensor (4, 11, 11) – [lat/90, lon/180, VZA/90, SZA/90]
-        label : LongTensor (11, 11) – integer class label 0-3
+        agri  : FloatTensor (7, H, W) – z-score normalised BT
+        geo   : FloatTensor (4, H, W) – [lat/90, lon/180, VZA/90, SZA/90]
+        label : LongTensor (H, W) – integer class label 0-3 (broadcast)
     """
 
     def __init__(self,
@@ -199,9 +199,27 @@ class PrecipDataset(Dataset):
                  len(self._index), len(h5_files), mode)
 
         self._warned_files = set()
+        # Per-worker file handle cache: avoid open/close on every __getitem__
+        self._fh_cache: dict = {}   # {Path: h5py.File}
 
     def __len__(self) -> int:
         return len(self._index)
+
+    def _get_fh(self, h5f: Path) -> h5py.File:
+        """Return cached file handle, opening if needed."""
+        fh = self._fh_cache.get(h5f)
+        if fh is None or not fh.id.valid:
+            # Evict oldest if cache grew too large
+            if len(self._fh_cache) >= 12:
+                oldest = next(iter(self._fh_cache))
+                try:
+                    self._fh_cache[oldest].close()
+                except Exception:
+                    pass
+                del self._fh_cache[oldest]
+            fh = h5py.File(h5f, "r")
+            self._fh_cache[h5f] = fh
+        return fh
 
     def __getitem__(self, idx: int):
         h5f, s_idx = self._index[idx]
@@ -209,23 +227,25 @@ class PrecipDataset(Dataset):
 
         for attempt in range(10):
             try:
-                with h5py.File(h5f, "r") as f:
-                    samples = f["Samples"]
-                    agri_patch = samples["agri"][s_idx].astype(np.float32)   # (7, H, W)
-                    geo_patch  = samples["geo"][s_idx].astype(np.float32)    # (4, H, W)
-                    label_val  = int(samples["label"][s_idx])                 # scalar
-
+                fh = self._get_fh(h5f)
+                samples = fh["Samples"]
+                agri_patch = samples["agri"][s_idx].astype(np.float32)   # (7, H, W)
+                geo_patch  = samples["geo"][s_idx].astype(np.float32)    # (2, H, W): lat, lon
+                label_val  = int(samples["label"][s_idx])                 # scalar 0-3
                 break
             except Exception:
+                try:
+                    del self._fh_cache[h5f]
+                except Exception:
+                    pass
                 if attempt == 0 and h5f.name not in self._warned_files:
                     log.warning("Read error at %s [%d]", h5f.name, s_idx)
                     self._warned_files.add(h5f)
                 if attempt == 9:
                     log.error("All read retries exhausted, returning zero sample")
                     return (
-                        torch.zeros(cfg.AGRI_CHANNELS, ph, pw),
-                        torch.zeros(cfg.GEO_CHANNELS, ph, pw),
-                        torch.full((ph, pw), -100, dtype=torch.long),
+                        torch.zeros(cfg.AGRI_CHANNELS + cfg.GEO_CHANNELS, ph, pw),
+                        torch.tensor(-100, dtype=torch.long),
                     )
                 h5f, s_idx = self._index[np.random.randint(0, len(self._index))]
 
@@ -234,67 +254,44 @@ class PrecipDataset(Dataset):
                      (self.stats.agri_std[:, None, None] + 1e-8)
         agri_norm = np.nan_to_num(agri_norm, nan=0.0)
 
-        # ── Geo normalisation ──
-        geo_norm = geo_patch.copy()
-        geo_norm[0] = geo_patch[0] / 90.0
-        geo_norm[1] = geo_patch[1] / 180.0
-        geo_norm[2] = geo_patch[2] / 90.0
-        geo_norm[3] = geo_patch[3] / 90.0
+        # ── Geo normalisation: lat/90, lon/180 ──
+        geo_norm = np.stack([
+            geo_patch[0] / 90.0,
+            geo_patch[1] / 180.0,
+        ], axis=0).astype(np.float32)
         geo_norm = np.nan_to_num(geo_norm, nan=0.0)
 
-        # ── Label: broadcast scalar to full patch ──
-        label = np.full((ph, pw), label_val, dtype=np.int64)
-
-        # ── Train augmentations ──
+        # ── Train augmentations (applied to BT + geo together) ──
         if self.mode == "train":
-            # Gaussian noise on BTs
             agri_norm = agri_norm + np.random.randn(*agri_norm.shape).astype(np.float32) * 0.02
 
-            # Random horizontal / vertical flip
             if np.random.rand() < 0.5:
                 agri_norm = np.flip(agri_norm, axis=2).copy()
                 geo_norm  = np.flip(geo_norm,  axis=2).copy()
-                label     = np.flip(label,     axis=1).copy()
             if np.random.rand() < 0.5:
                 agri_norm = np.flip(agri_norm, axis=1).copy()
                 geo_norm  = np.flip(geo_norm,  axis=1).copy()
-                label     = np.flip(label,     axis=0).copy()
 
-            # Random 90° rotation
             k = np.random.randint(0, 4)
             if k:
                 agri_norm = np.rot90(agri_norm, k=k, axes=(1, 2)).copy()
                 geo_norm  = np.rot90(geo_norm,  k=k, axes=(1, 2)).copy()
-                label     = np.rot90(label,     k=k, axes=(0, 1)).copy()
 
-        # ── Convert to torch ──
-        agri_t = torch.from_numpy(agri_norm.copy())
-        geo_t  = torch.from_numpy(geo_norm.copy())
-        lbl_t  = torch.from_numpy(label.copy())
+        # ── Concat BT + geo → single tensor (C+2, H, W) ──
+        x = np.concatenate([agri_norm, geo_norm], axis=0)   # (9, H, W)
+        x = torch.from_numpy(x.copy())
+        lbl = torch.tensor(label_val, dtype=torch.long)
 
-        return agri_t, geo_t, lbl_t
+        return x, lbl
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_dataloaders(stats: NormStats):
-    """Return train / val / test DataLoaders."""
-    train_ds = PrecipDataset(cfg.PAIRED_TRAIN_DIR, stats, mode="train")
-    val_ds   = PrecipDataset(cfg.PAIRED_VAL_DIR,   stats, mode="val")
-    test_ds  = PrecipDataset(cfg.PAIRED_TEST_DIR,  stats, mode="test")
-
-    common   = dict(pin_memory=True, num_workers=cfg.NUM_WORKERS)
-    train_dl = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,  **common)
-    val_dl   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False, **common)
-    test_dl  = DataLoader(test_ds,  batch_size=cfg.BATCH_SIZE, shuffle=False, **common)
-
-    return train_dl, val_dl, test_dl
-
-
 def build_test_dataloader(stats: NormStats):
     """Return only the test DataLoader."""
     test_ds = PrecipDataset(cfg.PAIRED_TEST_DIR, stats, mode="test")
     return DataLoader(test_ds, batch_size=cfg.BATCH_SIZE, shuffle=False,
-                      pin_memory=True, num_workers=cfg.NUM_WORKERS)
+                      pin_memory=True, num_workers=cfg.NUM_WORKERS,
+                      persistent_workers=True, prefetch_factor=4)

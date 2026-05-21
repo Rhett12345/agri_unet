@@ -125,13 +125,25 @@ GPM_LAT_SIZE = 1800           # GPM latitude dimension
 GPM_FILL_VALUE = -9999.9      # GPM IMERG fill value
 
 # AGRI pixel size in degrees (approx) for resampling
-AGRI_PIXEL_DEG = 0.04
+AGRI_PIXEL_DEG = 0.036
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9.  Patch / dataset parameters
 # ─────────────────────────────────────────────────────────────────────────────
-PATCH_SIZE    = (11, 11)
-PATCH_OVERLAP = 5             # pixels overlap for inference sliding window
+PATCH_SIZE    = (33, 33)
+PATCH_OVERLAP = (16, 16)      # pixels overlap for inference sliding window
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9b.  Class weights & sampling
+# ─────────────────────────────────────────────────────────────────────────────
+# Hard loss weights per class
+CLASS_WEIGHTS = [1.0, 1.5, 2.0, 3.0]
+
+# Target batch composition ratios
+TARGET_RATIOS = [0.40, 0.25, 0.20, 0.15]
+
+# Fraction of training data used per epoch (random subsample)
+SUBSAMPLE_FRAC = float(os.environ.get("UNET_SUBSAMPLE_FRAC", "0.2"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. Train / val / test date split
@@ -152,7 +164,7 @@ TEST_DATES  = _env_list("UNET_TEST_DATES", [
 # 11. Model hyper-parameters
 # ─────────────────────────────────────────────────────────────────────────────
 AGRI_CHANNELS  = len(AGRI_PHYSICAL_CHANNELS)   # 7
-GEO_CHANNELS   = 4                              # lat, lon, VZA, SZA (kept for compat)
+GEO_CHANNELS   = 2                              # lat, lon only
 NUM_CLASSES    = PRECIP_CLASSES                 # 4
 
 UNET_BASE_CHANNELS = 64
@@ -160,17 +172,17 @@ UNET_BASE_CHANNELS = 64
 # ─────────────────────────────────────────────────────────────────────────────
 # 12. Training hyper-parameters
 # ─────────────────────────────────────────────────────────────────────────────
-BATCH_SIZE    = 64
-NUM_EPOCHS    = 30
-LEARNING_RATE = 1e-4
+BATCH_SIZE    = 512
+NUM_EPOCHS    = 100
+LEARNING_RATE = 8e-4
 LR_PATIENCE   = 6
 LR_FACTOR     = 0.5
 MIN_LR        = 1e-6
 GRAD_CLIP     = 1.0
-NUM_WORKERS   = 5
+NUM_WORKERS   = 6
 
 # Early stopping
-EARLY_STOP_PATIENCE = 10
+EARLY_STOP_PATIENCE = 20
 
 # Loss
 LOSS_TYPE = os.environ.get("UNET_LOSS_TYPE", "weighted_ce")  # "weighted_ce" | "focal"
@@ -193,7 +205,7 @@ CHECKPOINT_BEST_F1_C3 = MODEL_DIR / f"{MODEL_NAME}_best_f1_c3.pth"
 # ─────────────────────────────────────────────────────────────────────────────
 # 14. Evaluation / inference
 # ─────────────────────────────────────────────────────────────────────────────
-EVAL_OUTPUT_DIR = ROOT / "eval_gpm"
+EVAL_OUTPUT_DIR = ROOT / "eval"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 15. Misc

@@ -33,6 +33,31 @@ from model import build_model
 log = logging.getLogger(__name__)
 
 
+def _build_region_mask(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """
+    构建区域 mask（True=在训练区域内）。
+    读取 fusion_config 中的 REGION_LAT/LON 参数。
+    """
+    try:
+        import fusion_config as fc
+        lat_min = float(getattr(fc, "REGION_LAT_MIN", -90))
+        lat_max = float(getattr(fc, "REGION_LAT_MAX", 90))
+        lon_min = float(getattr(fc, "REGION_LON_MIN", -180))
+        lon_max = float(getattr(fc, "REGION_LON_MAX", 180))
+    except ImportError:
+        return np.ones(lat.shape, dtype=bool)
+
+    # If any bound is at the global extreme, treat as no region filter
+    if lat_min <= -89 and lat_max >= 89 and lon_min <= -179 and lon_max >= 179:
+        return np.ones(lat.shape, dtype=bool)
+
+    log.info("Inference region: lat=[%.1f, %.1f] lon=[%.1f, %.1f]", lat_min, lat_max, lon_min, lon_max)
+    mask = (np.isfinite(lat) & np.isfinite(lon)
+            & (lat >= lat_min) & (lat <= lat_max)
+            & (lon >= lon_min) & (lon <= lon_max))
+    return mask
+
+
 def _gaussian_weight_map(ph: int, pw: int) -> np.ndarray:
     sigma_h, sigma_w = ph / 4.0, pw / 4.0
     yy = np.arange(ph) - ph / 2.0
@@ -75,8 +100,6 @@ def run_inference(agri_file: Path,
         d = np.load(agri_file, allow_pickle=True)
         BT  = d["BT_converted"] if "BT_converted" in d else d["BT"]
         lat = d["latitude"]; lon = d["longitude"]
-        vza = d.get("VZA", np.zeros_like(lat))
-        sza = d.get("SZA", np.zeros_like(lat))
     else:
         agri = read_agri_scene(agri_file)
         if agri is None:
@@ -84,77 +107,77 @@ def run_inference(agri_file: Path,
         BT  = agri["BT"]
         lat = agri["lat"]
         lon = agri["lon"]
-        vza = agri.get("VZA")
-        sza = agri.get("SZA")
 
     H, W = BT.shape[:2]
 
-    if vza is None or sza is None:
-        vza = np.zeros((H, W), dtype=np.float32)
-        sza = np.zeros((H, W), dtype=np.float32)
-
-    # ── Normalise ──
+    # ── Normalise BT ──
     BT_norm = (BT - stats.agri_mean) / (stats.agri_std + 1e-8)
 
-    geo = np.stack([
-        lat / 90.0, lon / 180.0,
-        vza / 90.0, sza / 90.0,
-    ], axis=-1).astype(np.float32)
-    geo = np.nan_to_num(geo, nan=0.0)
+    # ── Geo: only lat, lon (2 channels) ──
+    geo_full = np.stack([lat / 90.0, lon / 180.0], axis=-1).astype(np.float32)
+    geo_full = np.nan_to_num(geo_full, nan=0.0)
+
+    # ── Region mask ──
+    region_mask = _build_region_mask(lat, lon)
+    region_active = not bool(np.all(region_mask))
 
     # ── Patch geometry ──
     ph, pw   = cfg.PATCH_SIZE
-    overlap  = cfg.PATCH_OVERLAP
-    stride_h = max(1, ph - overlap)
-    stride_w = max(1, pw - overlap)
-    wmap     = _gaussian_weight_map(ph, pw)
+    overlap_h, overlap_w = cfg.PATCH_OVERLAP
+    stride_h = max(1, ph - overlap_h)
+    stride_w = max(1, pw - overlap_w)
+    wmap     = _gaussian_weight_map(ph, pw)   # (ph, pw)
 
     # ── Accumulation buffers ──
     C = cfg.NUM_CLASSES
     prob_sum    = np.zeros((H, W, C), dtype=np.float32)
     weight_sum  = np.zeros((H, W), dtype=np.float32)
 
-    patches_buf, geo_buf, positions_buf = [], [], []
+    x_buf, positions_buf = [], []
 
     def _flush():
-        if not patches_buf:
+        if not x_buf:
             return
-        x = torch.from_numpy(
-            np.stack(patches_buf, axis=0).transpose(0, 3, 1, 2)
-        ).to(device)
-        g = torch.from_numpy(
-            np.stack(geo_buf, axis=0).transpose(0, 3, 1, 2)
-        ).to(device)
+        x = torch.from_numpy(np.stack(x_buf, axis=0)).to(device)  # (B, C+2, ph, pw)
 
         with torch.no_grad():
             with torch.amp.autocast(device.type, enabled=(device.type == "cuda")):
-                logits = model(x, geo=g)
+                logits = model(x)                                    # (B, 4)
 
-        probs = F.softmax(logits, dim=1).cpu().numpy()   # (B, C, ph, pw)
+        probs = F.softmax(logits, dim=1).cpu().numpy()               # (B, 4)
 
         for b, (si, sj) in enumerate(positions_buf):
-            prob_sum[si:si+ph, sj:sj+pw, :] += probs[b].transpose(1, 2, 0) * wmap[..., np.newaxis]
+            # Broadcast patch-level prediction to whole patch with Gaussian weight
+            for c in range(C):
+                prob_sum[si:si+ph, sj:sj+pw, c] += probs[b, c] * wmap
             weight_sum[si:si+ph, sj:sj+pw] += wmap
 
-        patches_buf.clear()
-        geo_buf.clear()
+        x_buf.clear()
         positions_buf.clear()
 
-    for patch, si, sj in _extract_patches(BT_norm, ph, pw, stride_h, stride_w):
-        nan_ratio = np.isnan(patch).mean()
+    for bt_patch, si, sj in _extract_patches(BT_norm, ph, pw, stride_h, stride_w):
+        nan_ratio = np.isnan(bt_patch).mean()
         if nan_ratio > 0.8:
             continue
-        geo_patch = geo[si:si+ph, sj:sj+pw, :]
-        patch_filled = np.where(np.isnan(patch), 0.0, patch)
-        patches_buf.append(patch_filled)
-        geo_buf.append(geo_patch)
+        if region_active:
+            if not region_mask[si:si+ph, sj:sj+pw].any():
+                continue
+        geo_patch = geo_full[si:si+ph, sj:sj+pw, :]
+        bt_filled = np.where(np.isnan(bt_patch), 0.0, bt_patch)
+        # Concat BT + geo → (ph, pw, C+2) → (C+2, ph, pw)
+        x_patch = np.concatenate([bt_filled, geo_patch], axis=-1).transpose(2, 0, 1)
+        x_patch = np.ascontiguousarray(x_patch)
+        x_buf.append(x_patch)
         positions_buf.append((si, sj))
-        if len(patches_buf) >= batch_size:
+        if len(x_buf) >= batch_size:
             _flush()
     _flush()
 
     # ── Stitch ──
     prob_map = _stitch(prob_sum, weight_sum)   # (H, W, C)
+
+    if region_active:
+        prob_map[~region_mask] = np.nan
 
     class_map = np.full(prob_map.shape[:2], -1, dtype=np.int16)
     valid_mask = np.isfinite(prob_map).any(axis=-1)

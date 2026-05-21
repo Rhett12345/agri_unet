@@ -126,6 +126,23 @@ def _pair_one_scene(
 
         dt_min = abs((agri_dt - gpm_dt).total_seconds()) / 60.0
 
+        # ── GPM 完整覆盖检查：区域内 NaN 占比 ──
+        max_nan_frac = float(getattr(fc, "GPM_COVERAGE_MAX_NAN_FRAC", 0.05))
+        lat_min = float(getattr(fc, "REGION_LAT_MIN", -90))
+        lat_max = float(getattr(fc, "REGION_LAT_MAX", 90))
+        lon_min = float(getattr(fc, "REGION_LON_MIN", -180))
+        lon_max = float(getattr(fc, "REGION_LON_MAX", 180))
+        if lat_min > -89 or lat_max < 89 or lon_min > -179 or lon_max < 179:
+            # 找 region 在 GPM lat/lon 数组中的索引范围
+            lat_idx = np.searchsorted(gpm["lat"], [lat_min, lat_max])
+            lon_idx = np.searchsorted(gpm["lon"], [lon_min, lon_max])
+            lat_slice = slice(max(0, lat_idx[0]), min(len(gpm["lat"]), lat_idx[1]))
+            lon_slice = slice(max(0, lon_idx[0]), min(len(gpm["lon"]), lon_idx[1]))
+            region_precip = gpm["precip"][lat_slice, lon_slice]
+            nan_frac = np.isnan(region_precip).mean()
+            if nan_frac > max_nan_frac:
+                return False, out_path, f"GPM incomplete coverage: nan_frac={nan_frac:.3f} > {max_nan_frac}"
+
         # ── 收紧 AGRI 圆盘边界 ──
         margin = float(getattr(fc, "AGRI_DISK_MARGIN_DEG", 5.0))
         if margin > 0:
@@ -155,6 +172,10 @@ def _pair_one_scene(
             step=step,
             max_samples=max_s,
             min_precip_quality=min_q,
+            region_lat_min=float(getattr(fc, "REGION_LAT_MIN", -90)),
+            region_lat_max=float(getattr(fc, "REGION_LAT_MAX", 90)),
+            region_lon_min=float(getattr(fc, "REGION_LON_MIN", -180)),
+            region_lon_max=float(getattr(fc, "REGION_LON_MAX", 180)),
         )
 
         if not samples:

@@ -12,7 +12,7 @@ import multiprocessing as _mp
 # ─────────────────────────────────────────────────────────────────────────────
 # 时间匹配（分钟）
 # ─────────────────────────────────────────────────────────────────────────────
-TIME_MAX_MIN = float(os.environ.get("FUSION_TIME_MAX_MIN", "15.0"))
+TIME_MAX_MIN = float(os.environ.get("FUSION_TIME_MAX_MIN", "10.0"))
 # GPM 半小时文件与 AGRI 景的最大时间差
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -25,11 +25,8 @@ AGRI_DISK_MARGIN_DEG = float(os.environ.get("FUSION_AGRI_DISK_MARGIN_DEG", "5.0"
 AGRI_SUB_LON = float(os.environ.get("FUSION_AGRI_SUB_LON", "104.7"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch 采样
+# 质量控制
 # ─────────────────────────────────────────────────────────────────────────────
-PATCH_HALF = int(os.environ.get("FUSION_PATCH_HALF", "5"))  # half-size for 11×11
-
-# 质量控制：precipitationQualityIndex 最低阈值
 MIN_PRECIP_QUALITY = float(os.environ.get("FUSION_MIN_PRECIP_QUALITY", "0.0"))
 
 # GPM 格点采样步长（每隔 N 个格点采样一个，1=全采样）
@@ -39,9 +36,32 @@ GPM_SAMPLE_STEP = int(os.environ.get("FUSION_GPM_SAMPLE_STEP", "1"))
 MAX_SAMPLES_PER_SCENE = int(os.environ.get("FUSION_MAX_SAMPLES_PER_SCENE", "0"))
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 空间区域过滤（GPM 格点经纬度限制）
+# 默认：赤道两侧 ~25°×25°（~2800km×2800km），覆盖南北半球，
+# 位于 FY-4A (104.7°E) 与 FY-4B (~105°E) 共同覆盖范围内。
+# 设空字符串 "" 或 "none" 关闭区域过滤。
+# ─────────────────────────────────────────────────────────────────────────────
+def _parse_region_env(name, default):
+    raw = os.environ.get(name, "").strip()
+    if raw.lower() in {"", "none", "false", "no"}:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+REGION_LAT_MIN = _parse_region_env("FUSION_REGION_LAT_MIN", -12.5)
+REGION_LAT_MAX = _parse_region_env("FUSION_REGION_LAT_MAX",  12.5)
+REGION_LON_MIN = _parse_region_env("FUSION_REGION_LON_MIN",  92.5)
+REGION_LON_MAX = _parse_region_env("FUSION_REGION_LON_MAX",  117.5)
+
+# GPM 完整覆盖：区域内 NaN 占比超过此阈值则跳过该 GPM 文件
+GPM_COVERAGE_MAX_NAN_FRAC = float(os.environ.get("FUSION_GPM_COVERAGE_MAX_NAN_FRAC", "0.05"))
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 多进程
 # ─────────────────────────────────────────────────────────────────────────────
-N_FUSION_WORKERS = int(os.environ.get("FUSION_N_WORKERS", str(max(1, (_mp.cpu_count() or 4) - 1))))
+N_FUSION_WORKERS = int(os.environ.get("FUSION_N_WORKERS", "4" ))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 调试 / 日志

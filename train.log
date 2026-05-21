@@ -1,0 +1,64 @@
+nohup: ignoring input
+2026-05-21 07:06:27 [INFO] __main__ - ============================================================
+2026-05-21 07:06:27 [INFO] __main__ - Pipeline stages: fuse
+2026-05-21 07:06:27 [INFO] __main__ - ============================================================
+2026-05-21 07:06:27 [INFO] __main__ - Stage: FUSE
+2026-05-21 07:06:27 [INFO] data_fusion - Day 20190101 | AGRI=40 GPM=48 | workers=8 dt_max=10min
+2026-05-21 07:06:27 [INFO] data_fusion - Day 20190101 | tasks=16 skipped(no_agri_match)=32
+2026-05-21 07:07:51 [INFO] fusion_io - Finalised GPM_AGRI_20190101_114500_114459.h5 (62500 samples)
+2026-05-21 07:08:05 [INFO] fusion_io - Finalised GPM_AGRI_20190101_001500_001459.h5 (62500 samples)
+2026-05-21 07:08:05 [INFO] fusion_io - Finalised GPM_AGRI_20190101_091500_091459.h5 (62500 samples)
+2026-05-21 07:08:06 [INFO] fusion_io - Finalised GPM_AGRI_20190101_084500_084459.h5 (62500 samples)
+2026-05-21 07:08:07 [INFO] fusion_io - Finalised GPM_AGRI_20190101_054500_054459.h5 (62500 samples)
+2026-05-21 07:08:07 [INFO] fusion_io - Finalised GPM_AGRI_20190101_024500_024459.h5 (62500 samples)
+2026-05-21 07:08:07 [INFO] fusion_io - Finalised GPM_AGRI_20190101_061500_061459.h5 (62500 samples)
+2026-05-21 07:08:08 [INFO] fusion_io - Finalised GPM_AGRI_20190101_031500_031459.h5 (62500 samples)
+2026-05-21 07:09:13 [INFO] fusion_io - Finalised GPM_AGRI_20190101_121500_121459.h5 (62500 samples)
+2026-05-21 07:09:27 [INFO] fusion_io - Finalised GPM_AGRI_20190101_144500_144459.h5 (62500 samples)
+2026-05-21 07:09:27 [INFO] fusion_io - Finalised GPM_AGRI_20190101_151500_151459.h5 (62500 samples)
+2026-05-21 07:09:28 [INFO] fusion_io - Finalised GPM_AGRI_20190101_174500_174459.h5 (62500 samples)
+2026-05-21 07:09:29 [INFO] fusion_io - Finalised GPM_AGRI_20190101_204500_204459.h5 (62500 samples)
+2026-05-21 07:09:29 [INFO] fusion_io - Finalised GPM_AGRI_20190101_181500_181459.h5 (62500 samples)
+2026-05-21 07:09:29 [INFO] fusion_io - Finalised GPM_AGRI_20190101_211500_211459.h5 (62500 samples)
+2026-05-21 07:09:42 [INFO] fusion_io - Finalised GPM_AGRI_20190101_234500_234459.h5 (62500 samples)
+2026-05-21 07:09:43 [INFO] data_fusion - Day 20190101 - 16/16 ok
+2026-05-21 07:09:43 [INFO] data_fusion - Day 20190102 | AGRI=40 GPM=48 | workers=8 dt_max=10min
+2026-05-21 07:09:43 [INFO] data_fusion - Day 20190102 | tasks=16 skipped(no_agri_match)=32
+2026-05-21 07:11:08 [INFO] fusion_io - Finalised GPM_AGRI_20190102_114500_114459.h5 (62500 samples)
+2026-05-21 07:11:20 [INFO] fusion_io - Finalised GPM_AGRI_20190102_001500_001459.h5 (62500 samples)
+2026-05-21 07:11:21 [INFO] fusion_io - Finalised GPM_AGRI_20190102_091500_091459.h5 (62500 samples)
+2026-05-21 07:11:21 [INFO] fusion_io - Finalised GPM_AGRI_20190102_024500_024459.h5 (62500 samples)
+2026-05-21 07:11:23 [INFO] fusion_io - Finalised GPM_AGRI_20190102_084500_084459.h5 (62500 samples)
+2026-05-21 07:11:23 [INFO] fusion_io - Finalised GPM_AGRI_20190102_061500_061459.h5 (62500 samples)
+2026-05-21 07:11:23 [INFO] fusion_io - Finalised GPM_AGRI_20190102_054500_054459.h5 (62500 samples)
+2026-05-21 07:11:24 [INFO] fusion_io - Finalised GPM_AGRI_20190102_031500_031459.h5 (62500 samples)
+2026-05-21 07:12:31 [INFO] fusion_io - Finalised GPM_AGRI_20190102_121500_121459.h5 (62500 samples)
+2026-05-21 07:12:42 [INFO] fusion_io - Finalised GPM_AGRI_20190102_144500_144459.h5 (62500 samples)
+2026-05-21 07:12:43 [INFO] fusion_io - Finalised GPM_AGRI_20190102_151500_151459.h5 (62500 samples)
+2026-05-21 07:12:44 [INFO] fusion_io - Finalised GPM_AGRI_20190102_174500_174459.h5 (62500 samples)
+2026-05-21 07:12:47 [INFO] fusion_io - Finalised GPM_AGRI_20190102_181500_181459.h5 (62500 samples)
+2026-05-21 07:12:47 [INFO] fusion_io - Finalised GPM_AGRI_20190102_204500_204459.h5 (62500 samples)
+2026-05-21 07:12:48 [INFO] fusion_io - Finalised GPM_AGRI_20190102_211500_211459.h5 (62500 samples)
+2026-05-21 07:13:00 [INFO] fusion_io - Finalised GPM_AGRI_20190102_234500_234459.h5 (62500 samples)
+2026-05-21 07:13:01 [INFO] data_fusion - Day 20190102 - 16/16 ok
+2026-05-21 07:13:01 [INFO] data_fusion - Day 20190103 | AGRI=40 GPM=48 | workers=8 dt_max=10min
+2026-05-21 07:13:01 [INFO] data_fusion - Day 20190103 | tasks=16 skipped(no_agri_match)=32
+2026-05-21 07:14:27 [INFO] fusion_io - Finalised GPM_AGRI_20190103_114500_114459.h5 (62500 samples)
+2026-05-21 07:14:38 [INFO] fusion_io - Finalised GPM_AGRI_20190103_091500_091459.h5 (62500 samples)
+2026-05-21 07:14:39 [INFO] fusion_io - Finalised GPM_AGRI_20190103_084500_084459.h5 (62500 samples)
+2026-05-21 07:14:39 [INFO] fusion_io - Finalised GPM_AGRI_20190103_001500_001459.h5 (62500 samples)
+2026-05-21 07:14:40 [INFO] fusion_io - Finalised GPM_AGRI_20190103_054500_054459.h5 (62500 samples)
+2026-05-21 07:14:40 [INFO] fusion_io - Finalised GPM_AGRI_20190103_031500_031459.h5 (62500 samples)
+2026-05-21 07:14:40 [INFO] fusion_io - Finalised GPM_AGRI_20190103_024500_024459.h5 (62500 samples)
+2026-05-21 07:14:41 [INFO] fusion_io - Finalised GPM_AGRI_20190103_061500_061459.h5 (62500 samples)
+2026-05-21 07:15:49 [INFO] fusion_io - Finalised GPM_AGRI_20190103_121500_121459.h5 (62500 samples)
+2026-05-21 07:15:59 [INFO] fusion_io - Finalised GPM_AGRI_20190103_144500_144459.h5 (62500 samples)
+2026-05-21 07:16:00 [INFO] fusion_io - Finalised GPM_AGRI_20190103_151500_151459.h5 (62500 samples)
+2026-05-21 07:16:00 [INFO] fusion_io - Finalised GPM_AGRI_20190103_174500_174459.h5 (62500 samples)
+2026-05-21 07:16:02 [INFO] fusion_io - Finalised GPM_AGRI_20190103_181500_181459.h5 (62500 samples)
+2026-05-21 07:16:02 [INFO] fusion_io - Finalised GPM_AGRI_20190103_211500_211459.h5 (62500 samples)
+2026-05-21 07:16:02 [INFO] fusion_io - Finalised GPM_AGRI_20190103_204500_204459.h5 (62500 samples)
+2026-05-21 07:16:14 [INFO] fusion_io - Finalised GPM_AGRI_20190103_234500_234459.h5 (62500 samples)
+2026-05-21 07:16:14 [INFO] data_fusion - Day 20190103 - 16/16 ok
+2026-05-21 07:16:14 [INFO] data_fusion - Day 20190104 | AGRI=40 GPM=48 | workers=8 dt_max=10min
+2026-05-21 07:16:14 [INFO] data_fusion - Day 20190104 | tasks=16 skipped(no_agri_match)=32

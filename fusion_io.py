@@ -485,7 +485,7 @@ def write_gpm_fused_samples(
 
         s = f.create_group("Samples")
         ds_agri  = _create_ds(s, "agri",  (C, ph, pw))
-        ds_geo   = _create_ds(s, "geo",   (4, ph, pw))
+        ds_geo   = _create_ds(s, "geo",   (2, ph, pw))
         ds_label = _create_ds(s, "label", (), np.int32)
         ds_precip = _create_ds(s, "precip", ())
         ds_lat   = _create_ds(s, "gpm_lat", ())

@@ -112,6 +112,10 @@ def match_agri_to_gpm(
     step: int = 1,
     max_samples: int = 0,
     min_precip_quality: float = 0.0,
+    region_lat_min: float = -90.0,
+    region_lat_max: float = 90.0,
+    region_lon_min: float = -180.0,
+    region_lon_max: float = 180.0,
 ) -> List[dict]:
     """
     将 AGRI 数据匹配到 GPM 格点，为每个有效 GPM 格点生成一个样本。
@@ -132,8 +136,8 @@ def match_agri_to_gpm(
     -------
     List of dict with agri, geo, label, precip, gpm_lat, gpm_lon, dt_min
     """
-    ph_half = fc.PATCH_HALF   # 5 → 11×11 patch
-    ph, pw = cfg.PATCH_SIZE    # (11, 11)
+    ph, pw = cfg.PATCH_SIZE
+    ph_half = ph // 2
 
     agri_lat = agri["lat"]
     agri_lon = agri["lon"]
@@ -184,9 +188,13 @@ def match_agri_to_gpm(
         plat = gpm_lat[li]
         if plat < agri_lat_min - 1.0 or plat > agri_lat_max + 1.0:
             continue
+        if plat < region_lat_min or plat > region_lat_max:
+            continue
         for lj in range(0, N_lon, step):
             plon = gpm_lon[lj]
             if plon < agri_lon_min - 1.0 or plon > agri_lon_max + 1.0:
+                continue
+            if plon < region_lon_min or plon > region_lon_max:
                 continue
             pval = gpm_precip[li, lj]
             if not np.isfinite(pval) or pval < -9000:
@@ -230,8 +238,6 @@ def match_agri_to_gpm(
         patch_bt = agri_bt[r_start:r_end, c_start:c_end, :].copy()           # (11, 11, 7)
         patch_lat = agri_lat[r_start:r_end, c_start:c_end].copy()
         patch_lon = agri_lon[r_start:r_end, c_start:c_end].copy()
-        patch_vza = agri_vza[r_start:r_end, c_start:c_end].copy()
-        patch_sza = agri_sza[r_start:r_end, c_start:c_end].copy()
 
         # 有效性检查
         valid_frac = np.isfinite(patch_bt).mean()
@@ -242,10 +248,8 @@ def match_agri_to_gpm(
         patch_bt = np.where(np.isfinite(patch_bt), patch_bt, 0.0).astype(np.float32)
         patch_lat = np.where(np.isfinite(patch_lat), patch_lat, 0.0).astype(np.float32)
         patch_lon = np.where(np.isfinite(patch_lon), patch_lon, 0.0).astype(np.float32)
-        patch_vza = np.where(np.isfinite(patch_vza), patch_vza, 0.0).astype(np.float32)
-        patch_sza = np.where(np.isfinite(patch_sza), patch_sza, 0.0).astype(np.float32)
 
-        # 夜间：可见光通道置零
+        # 夜间：可见光通道置零（用场景级 SZA 判断）
         if night:
             for vi in cfg.VIS_CHANNEL_INDICES:
                 patch_bt[:, :, vi] = 0.0
@@ -253,8 +257,8 @@ def match_agri_to_gpm(
         # Transpose BT to (C, H, W)
         patch_bt = patch_bt.transpose(2, 0, 1)   # (7, 11, 11)
 
-        # Geo stack: (4, H, W)
-        geo = np.stack([patch_lat, patch_lon, patch_vza, patch_sza], axis=0).astype(np.float32)
+        # Geo: only lat, lon (2 channels)
+        geo = np.stack([patch_lat, patch_lon], axis=0).astype(np.float32)
 
         li, lj, pval = query_idx[qi]
         label = cfg.precip_to_class(float(pval))
